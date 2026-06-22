@@ -10,6 +10,7 @@
 
 use std::io;
 
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Hard cap on a single frame's payload. Inference responses with
@@ -49,6 +50,65 @@ pub fn try_decode<T: DeserializeOwned>(buf: &[u8]) -> Result<Option<(T, usize)>,
     let value: T = bincode::deserialize(&buf[4..4 + len])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bincode decode: {e}")))?;
     Ok(Some((value, 4 + len)))
+}
+
+/// Encode `msg` and write the whole frame to `w`. Buffers the
+/// payload in memory (the `encode` step needs the full length up
+/// front to write the header), then drops it in a single
+/// `write_all`. Caller is responsible for the writer's flush
+/// semantics — UDS doesn't auto-flush across `write_all` so call
+/// `w.flush().await` between bursts when latency matters.
+pub async fn write_frame_async<W, T>(w: &mut W, msg: &T) -> Result<(), io::Error>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
+    let frame = encode(msg)?;
+    w.write_all(&frame).await
+}
+
+/// Read exactly one frame from `r`. Reads the 4-byte header, then
+/// the payload, then bincode-decodes. Returns `Ok(None)` on clean
+/// EOF (the peer closed before sending a header); any other read
+/// short of the expected length surfaces as `UnexpectedEof`.
+///
+/// Allocates one `Vec<u8>` per call sized to the payload length.
+/// Frames are small (handshake / progress) to medium (inference
+/// response with raw_text in the kilobytes), so the allocation is
+/// not a hot-path concern. If it becomes one, lift the buffer onto
+/// the connection state.
+pub async fn read_frame_async<R, T>(r: &mut R) -> Result<Option<T>, io::Error>
+where
+    R: AsyncReadExt + Unpin,
+    T: DeserializeOwned,
+{
+    let mut hdr = [0u8; 4];
+    // Distinguish clean EOF from a short header. Read into the buffer
+    // one byte at a time for the first byte so we can detect the EOF
+    // boundary cleanly without `read_exact`'s "fail on any short
+    // read" treatment.
+    let first = match r.read(&mut hdr[..1]).await? {
+        0 => return Ok(None),
+        1 => 1,
+        _ => unreachable!("read of buf[..1] returned > 1"),
+    };
+    if first < 4 {
+        // Got at least one byte — anything short now is an unclean
+        // EOF (peer closed mid-header).
+        r.read_exact(&mut hdr[first..]).await?;
+    }
+    let len = u32::from_le_bytes(hdr) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame header {len} > MAX_FRAME_BYTES {MAX_FRAME_BYTES}"),
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload).await?;
+    let value: T = bincode::deserialize(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bincode decode: {e}")))?;
+    Ok(Some(value))
 }
 
 #[cfg(test)]

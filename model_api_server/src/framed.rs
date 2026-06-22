@@ -10,6 +10,7 @@
 
 use std::io;
 
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -42,4 +43,41 @@ pub fn try_decode<T: DeserializeOwned>(buf: &[u8]) -> Result<Option<(T, usize)>,
     let value: T = bincode::deserialize(&buf[4..4 + len])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bincode decode: {e}")))?;
     Ok(Some((value, 4 + len)))
+}
+
+pub async fn write_frame_async<W, T>(w: &mut W, msg: &T) -> Result<(), io::Error>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
+    let frame = encode(msg)?;
+    w.write_all(&frame).await
+}
+
+pub async fn read_frame_async<R, T>(r: &mut R) -> Result<Option<T>, io::Error>
+where
+    R: AsyncReadExt + Unpin,
+    T: DeserializeOwned,
+{
+    let mut hdr = [0u8; 4];
+    let first = match r.read(&mut hdr[..1]).await? {
+        0 => return Ok(None),
+        1 => 1,
+        _ => unreachable!("read of buf[..1] returned > 1"),
+    };
+    if first < 4 {
+        r.read_exact(&mut hdr[first..]).await?;
+    }
+    let len = u32::from_le_bytes(hdr) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame header {len} > MAX_FRAME_BYTES {MAX_FRAME_BYTES}"),
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload).await?;
+    let value: T = bincode::deserialize(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bincode decode: {e}")))?;
+    Ok(Some(value))
 }
