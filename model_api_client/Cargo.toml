@@ -1,0 +1,17 @@
+[package]
+name = "model_api_client"
+version = "0.1.0"
+edition = "2021"
+
+# UDS client + length-prefixed bincode codec for the model_api server.
+# Pulls `model_api_proto` for the wire types; nothing else from the
+# workspace today so the dep tree stays tight.
+
+[dependencies]
+model_api_proto = { path = "../model_api_proto" }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "1.3" }
+smol = "2"
+async-channel = "2"
+futures-lite = "2"
+log = "0.4"

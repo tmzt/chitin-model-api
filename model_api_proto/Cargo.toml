@@ -1,0 +1,14 @@
+[package]
+name = "model_api_proto"
+version = "0.1.0"
+edition = "2021"
+
+# Wire protocol shared by `model_api_client` and `model_api_server`.
+# Only `serde` + `bincode`, no Rust runtime deps — this crate is meant
+# to be cheap to compile and easy to wrap from outside Rust later
+# (Python bindings via PyO3 / PyOxidizer are a stated downstream goal,
+# so the proto stays small and free of heavy transitive deps).
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "1.3" }
