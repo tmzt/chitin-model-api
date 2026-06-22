@@ -1,27 +1,19 @@
 //! `chitin-model-api` — UDS server that owns the llama.cpp Session +
-//! smart KV cache. Receives `model_api_proto::ClientMessage`s,
-//! processes them sequentially through a single global slot, replies
-//! with `ServerMessage`s on the same socket.
-//!
-//! Scaffold: today this just listens on UDS, accepts a connection,
-//! exchanges the Hello handshake, and rejects every inference with
-//! "not implemented". Real slot wiring lands in follow-up commits.
+//! smart KV cache. Thin shim: parses CLI, builds the production
+//! slot, hands off to `model_api_server::serve`.
 //!
 //! Run:
 //!   chitin-model-api --socket /tmp/chitin-model-api.sock --model <path>
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use model_api_proto::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
+use model_api_server::{serve, SlotHandle};
 
-mod framed;
-
-/// CLI args parsed by hand — no clap dep so the binary stays small.
 struct Args {
     socket_path: PathBuf,
-    /// GGUF model file. Required when the `llama-cpp` feature is on;
-    /// today the scaffold ignores it.
-    _model_path: Option<PathBuf>,
+    #[allow(dead_code)] // wired in stage 2's llama-cpp impl
+    model_path: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -41,58 +33,31 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         socket_path: socket_path.ok_or_else(|| "--socket is required".to_string())?,
-        _model_path: model_path,
+        model_path,
     })
 }
 
 fn main() -> Result<(), String> {
     env_logger::init();
     let args = parse_args()?;
-    log::info!(
-        "[model_api] starting: socket={} protocol_version={}",
-        args.socket_path.display(),
-        PROTOCOL_VERSION,
-    );
-    smol::block_on(serve(args))
-}
 
-async fn serve(args: Args) -> Result<(), String> {
-    // Best-effort: remove a stale socket file so re-launches work
-    // without manual cleanup. If somebody's actually listening on it
-    // this returns "address in use" on bind below, which is the
-    // right behaviour — don't blow away an active server.
-    let _ = std::fs::remove_file(&args.socket_path);
-
-    let listener = smol::net::unix::UnixListener::bind(&args.socket_path)
-        .map_err(|e| format!("bind {}: {e}", args.socket_path.display()))?;
-    log::info!("[model_api] listening on {}", args.socket_path.display());
-
-    loop {
-        let (stream, _addr) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("accept: {e}"))?;
-        log::info!("[model_api] connection accepted");
-        smol::spawn(async move {
-            if let Err(e) = handle_client(stream).await {
-                log::warn!("[model_api] connection ended: {e}");
-            }
-        })
-        .detach();
-    }
-}
-
-async fn handle_client(_stream: smol::net::unix::UnixStream) -> Result<(), String> {
-    // Scaffold: handshake only, then read-loop that rejects everything
-    // with InferenceError so a client doesn't silently hang. Real
-    // codec wiring (framed::read_frame / write_frame against the
-    // split halves) lands in a follow-up commit alongside the slot
-    // owner.
-    let _ = ClientMessage::Hello { protocol_version: PROTOCOL_VERSION };
-    let _ = ServerMessage::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        model_name: "scaffold".into(),
-        gpu_memory_mb: None,
+    // Pick the production slot. `llama-cpp` feature gates the real
+    // wiring; without it we fall back to the stub so the binary at
+    // least serves a connection and reports "no backend" cleanly.
+    let slot: Arc<dyn SlotHandle> = {
+        #[cfg(feature = "llama-cpp")]
+        {
+            // Real llama-cpp wiring lands in a follow-up commit. For
+            // now we use the stub so the binary builds with or
+            // without the feature.
+            let _ = args.model_path; // silence dead-code under stub
+            Arc::new(model_api_server::slot::StubSlot::new("stub-llama"))
+        }
+        #[cfg(not(feature = "llama-cpp"))]
+        {
+            Arc::new(model_api_server::slot::StubSlot::new("stub-no-backend"))
+        }
     };
-    Ok(())
+
+    smol::block_on(serve(args.socket_path, slot))
 }
