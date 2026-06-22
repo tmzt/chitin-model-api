@@ -16,12 +16,17 @@ name = "chitin-model-api"
 path = "src/main.rs"
 
 [features]
-default = ["llama-cpp"]
+# Default is no backend, so the workspace can build the lib + run
+# its E2E tests (StubSlot only) without paying the llama-cpp dep
+# tree cost. Enable `llama-cpp` explicitly for the production binary
+# — that's what `make run-modelapi` does.
+default = []
 
-# Pull in llama_engine + the llama-cpp-2 path dep. Mirrors
-# thinker_impl's same-named feature so the workspace can build either
-# with or without the GGUF backend.
-llama-cpp = ["dep:llama_engine", "dep:llama-cpp-2"]
+# Real backend: pulls thinker_impl with its `llama-cpp` feature so
+# the server's LlamaSlot can call spawn_resource and own the slot.
+# Also pulls common + llama-cpp-2 transitively. Mirrors
+# thinker_impl's same-named feature.
+llama-cpp = ["dep:thinker_impl", "dep:common"]
 
 [lib]
 path = "src/lib.rs"
@@ -38,5 +43,5 @@ log = "0.4"
 env_logger = "0.11"
 
 # Backend wiring — present only with the `llama-cpp` feature.
-llama_engine = { path = "../llama_engine", optional = true }
-llama-cpp-2 = { path = "../deps/llama-cpp-2/llama-cpp-2", features = ["sampler"], optional = true }
+thinker_impl = { path = "../thinker_impl", features = ["llama-cpp"], optional = true }
+common = { path = "../common", optional = true }

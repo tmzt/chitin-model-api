@@ -18,6 +18,13 @@ use model_api_proto::{
 pub mod framed;
 pub mod slot;
 
+// Real backend — gated on `llama-cpp` because it pulls
+// thinker_impl + llama-cpp-2 + llama_engine. Without the feature,
+// only StubSlot is available (which is what the integration tests
+// use).
+#[cfg(feature = "llama-cpp")]
+pub mod llama_slot;
+
 pub use slot::{SlotHandle, SlotRequest, SlotResponse};
 
 /// Per-connection identity for logging.
