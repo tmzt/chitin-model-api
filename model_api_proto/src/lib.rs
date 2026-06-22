@@ -135,24 +135,29 @@ pub enum GpuRole {
 }
 
 /// Streamed text chunk emitted during generation (when
-/// `InferenceRequest::stream` is true).
+/// `InferenceRequest::stream` is true). Mirrors
+/// `common::handles::StreamChunk`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
     /// Newly decoded text since the previous chunk.
-    pub delta: String,
+    pub delta_text: String,
+    /// Stop signal: `None` while generating, `Some` on the last chunk.
+    pub finish_reason: Option<String>,
 }
 
 /// Real-time progress milestone (when `InferenceRequest::progress` is
-/// true). The exact set is open — clients should treat unknown
-/// variants as informational.
+/// true). Mirrors `common::handles::ProgressEvent` — string-shaped
+/// for forward compatibility: clients that don't recognize a `phase`
+/// value should treat it as informational rather than error out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProgressEvent {
-    Queued,
-    Dispatched,
-    ToolCallStarted { name: String },
-    ToolCallCompleted { name: String },
-    GenerationStarted,
-    GenerationDone { tokens_generated: u32 },
+pub struct ProgressEvent {
+    /// One of `queued`, `dispatched`, `tool_start`, `tool_end`,
+    /// `gen_start`, `gen_done`, or any future server-defined value.
+    pub phase: String,
+    /// Tool name for tool-related phases.
+    pub tool: Option<String>,
+    /// Free-form descriptive detail (e.g. token count).
+    pub detail: Option<String>,
 }
 
 /// Final inference result. Mirrors `common::handles::ThinkerResponse`.
