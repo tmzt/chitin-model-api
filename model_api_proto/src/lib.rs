@@ -39,7 +39,13 @@ pub enum ClientMessage {
     Inference(InferenceRequest),
     /// Best-effort cancel of the current in-flight inference.
     Cancel,
-    /// Clean shutdown — server drains its queue, then exits.
+    /// Close this connection cleanly. Server replies with
+    /// [`ServerMessage::Goodbye`] then closes the connection. Does
+    /// NOT shut down the server process — the slot's reference
+    /// count drops by one; other clients continue unaffected.
+    /// Functionally equivalent to dropping the socket; the wire
+    /// frame just lets the server log a polite hangup instead of
+    /// an abrupt EOF.
     Shutdown,
 }
 

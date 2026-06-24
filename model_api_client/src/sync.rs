@@ -158,9 +158,19 @@ impl SyncClient {
         }
     }
 
-    /// Ask the server to drain its queue and exit. Returns once the
-    /// server's `Goodbye` frame arrives (or on disconnect). The
-    /// underlying socket closes when `self` drops.
+    /// Close this client's connection.
+    ///
+    /// Sends a polite `Shutdown` frame, waits for the server's
+    /// `Goodbye` (or EOF), then returns. The server keeps running —
+    /// this only releases this connection's slot reference; the
+    /// underlying slot stays alive as long as another client holds a
+    /// reference, or as long as the server process is up.
+    ///
+    /// Dropping the `SyncClient` without calling `shutdown` also
+    /// works — the socket closes from the kernel side and the
+    /// server's connection handler sees EOF. `shutdown` is the
+    /// polite version that lets the server log a clean disconnect
+    /// instead of an abrupt one.
     pub fn shutdown(&self) -> Result<(), ClientError> {
         let mut guard = self.stream.lock()
             .map_err(|_| ClientError::Io("client mutex poisoned".into()))?;

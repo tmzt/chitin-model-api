@@ -108,7 +108,10 @@ impl Client {
         Ok(())
     }
 
-    /// Ask the server to drain its queue and exit. **Scaffold stub.**
+    /// Close this client's connection cleanly. Does NOT shut down
+    /// the server — only decrements the slot's refcount by one;
+    /// other clients continue. **Scaffold stub** (use
+    /// [`SyncClient::shutdown`] for the real implementation).
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let _ = ClientMessage::Shutdown;
         let _ = ServerMessage::Goodbye;

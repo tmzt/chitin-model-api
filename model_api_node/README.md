@@ -238,9 +238,12 @@ await c.shutdown();
 
 ### `client.shutdown(): Promise<void>`
 
-Ask the server to drain its queue and exit. Resolves once the
-server replies with its `Goodbye` (or on a clean disconnect). The
-client's socket closes when the `Client` is garbage-collected.
+Close this client's connection. Does **not** shut down the server —
+just decrements the slot's reference count; other clients (and the
+server process) continue. Resolves once the server replies with its
+`Goodbye` (or on a clean disconnect). Equivalent to letting the
+`Client` go out of scope; `shutdown` is the polite version that lets
+the server log a clean hangup instead of an abrupt EOF.
 
 ## Running the server
 

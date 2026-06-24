@@ -250,9 +250,13 @@ impl Client {
         Ok(from_proto_response(resp))
     }
 
-    /// Ask the server to drain its queue and exit. Resolves once
-    /// the server's `Goodbye` arrives (or on disconnect — both are
-    /// considered clean).
+    /// Close this client's connection. Does NOT shut down the
+    /// server — the slot's reference count drops by one; other
+    /// clients (and the server process) continue. Resolves once
+    /// the server's `Goodbye` arrives (or on disconnect — both
+    /// are considered clean). Equivalent to letting the `Client`
+    /// drop, but lets the server log a polite hangup instead of
+    /// an abrupt EOF.
     #[napi]
     pub async fn shutdown(&self) -> Result<()> {
         let inner = self.inner.clone();

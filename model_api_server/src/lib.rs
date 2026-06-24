@@ -151,6 +151,17 @@ pub async fn handle_client(
                 log::debug!("[model_api] conn {conn_id}: Cancel (no-op for now)");
             }
             ClientMessage::Shutdown => {
+                // Polite client hangup. Close this connection only —
+                // the server keeps running, the slot keeps its other
+                // references. Reply with Goodbye so the client can
+                // distinguish a clean disconnect from an abrupt EOF
+                // (e.g. a kernel-side socket close on a crashed
+                // peer). When this fn returns, the `slot: Arc<dyn
+                // SlotHandle>` clone we hold drops — the slot's
+                // refcount goes down by one, hits zero when the
+                // last connection ends + serve()'s root Arc also
+                // drops (today: never, slot lives for the server's
+                // lifetime).
                 framed::write_frame_async(&mut writer, &ServerMessage::Goodbye).await
                     .map_err(|e| format!("conn {conn_id}: write goodbye: {e}"))?;
                 let _ = writer.flush().await;
