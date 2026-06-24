@@ -162,6 +162,23 @@ interface InferenceRequest {
    * block in the output. Default false.
    */
   disableThinkPrefix?: boolean
+
+  // ── Streaming knobs (apply to `inferenceStream` only) ──
+  /**
+   * Flush a chunk every N visible (or thinking) characters.
+   * Server default = 16. Smaller = smoother typewriter UI + more
+   * wire frames; larger = quieter wire. Ignored by non-streaming
+   * `inference`.
+   */
+  streamChunkChars?: number
+
+  /**
+   * Also emit chunks for content inside `<think>...</think>`
+   * reasoning blocks, tagged `phase: 'thinking'`. Default false —
+   * thinking content is still stripped from `response.text` either
+   * way; this only controls whether deltas surface mid-flight.
+   */
+  streamThinking?: boolean
 }
 
 interface InferenceResponse {
@@ -191,6 +208,15 @@ interface InferenceResponse {
    * tools present). Empty otherwise.
    */
   toolCalls: ToolCall[]
+
+  /**
+   * Set when the in-band dispatcher signalled a session hand-off
+   * (e.g. `escalate_to_agent_mode` — a Fast classifier deciding the
+   * turn should re-enter on Deep with a rewritten input). Agent
+   * runtimes react by issuing a fresh request keyed on
+   * `templateSessionId` + `input`. `undefined` for the common case.
+   */
+  replacement?: { templateSessionId: string; input: string }
 }
 ```
 
@@ -363,6 +389,42 @@ at 64 MB per frame. Message envelopes are defined in
 [`model_api_proto`](../model_api_proto/src/lib.rs); the bindings
 mirror only the request/response halves (request senders + Arc
 dispatchers stay Rust-side).
+
+## Contributing — wire / node / docs lockstep
+
+The wire protocol, the napi bindings, and this README are three
+faces of the same surface and must move together in a single
+commit. Adding a field to `model_api_proto::InferenceRequest`
+without also surfacing it on `model_api_node::InferenceRequest`
+silently strands it: JS callers can't set it, the server reads the
+bincode default, and the regression is invisible until somebody
+tries to use the feature from the agent side.
+
+When you change `model_api_proto` (request, response, config, or
+events), in the same commit:
+
+1. **Bump `PROTOCOL_VERSION`** in `model_api_proto::lib.rs` if the
+   change is wire-incompatible (renamed/removed field, reordered
+   enum, changed bincode shape). Adding an `Option<T>` at the end
+   of a struct is backwards-compatible — no bump needed.
+2. **Mirror the field** in the corresponding `#[napi(object)]`
+   struct in `model_api_node::src::lib.rs`, with the same
+   `Option<...>` / required shape.
+3. **Update the translator** (`from_proto_response` or the request
+   builder in `Client::inference{,_stream}`) to copy the field in
+   both directions.
+4. **Document the field** in this README's TS interface block,
+   with the same doc-comment text as the proto / napi struct (one
+   source-of-truth phrasing keeps drift detectable on diff).
+5. **Update / add a test** in `model_api_client/tests/` (Rust round
+   trip) and `model_api_node/test.js` (JS smoke) so the new field
+   is exercised end-to-end against `StubSlot` at minimum.
+
+The `StubSlot` (`model_api_server/src/slot.rs`) is the
+ground-truth oracle for "did the new field actually arrive on the
+server side": its echo path can be extended in two lines to assert
+the field round-trips, which is cheap insurance against silent
+defaults.
 
 ## License
 

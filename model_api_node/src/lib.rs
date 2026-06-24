@@ -23,6 +23,15 @@
 //!                         finishReason?: string }
 //!   | { kind: 'progress', phase: string, tool?: string, detail?: string }
 //!
+//! export interface SessionReplacement {
+//!   templateSessionId: string
+//!   input: string
+//! }
+//!
+//! // Set on `InferenceResponse.replacement` when the in-band
+//! // dispatcher signalled a session hand-off; agent runtimes
+//! // react by issuing a fresh request with these fields.
+//!
 //! export interface ToolDef {
 //!   name: string
 //!   description: string
@@ -124,6 +133,18 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub call_id: String,
     pub output: String,
+}
+
+/// Session hand-off marker. Populated on `InferenceResponse` when
+/// the in-band dispatcher signalled a runtime switch
+/// (`escalate_to_agent_mode` or similar). Callers — typically
+/// agent runtimes — react by issuing a fresh request keyed on the
+/// supplied `templateSessionId` and `input`. Mirrors
+/// `model_api_proto::SessionReplacement`.
+#[napi(object)]
+pub struct SessionReplacement {
+    pub template_session_id: String,
+    pub input: String,
 }
 
 /// Event the server emits during a streaming inference.
@@ -233,6 +254,11 @@ pub struct InferenceResponse {
     /// execute (when `toolMode` was `'client'` or `'auto'` with
     /// tools present). Empty otherwise.
     pub tool_calls: Vec<ToolCall>,
+    /// Set when the in-band dispatcher signalled a session
+    /// hand-off (e.g. `escalate_to_agent_mode`). Agent runtimes
+    /// react by issuing a fresh request keyed on
+    /// `templateSessionId` + `input`. `null` for the common case.
+    pub replacement: Option<SessionReplacement>,
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -493,5 +519,9 @@ fn from_proto_response(r: proto::InferenceResponse) -> InferenceResponse {
             name: c.name,
             arguments_json: c.arguments_json,
         }).collect(),
+        replacement: r.replacement.map(|s| SessionReplacement {
+            template_session_id: s.template_session_id,
+            input: s.input,
+        }),
     }
 }
