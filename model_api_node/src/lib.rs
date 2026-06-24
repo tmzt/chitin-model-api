@@ -342,8 +342,15 @@ impl Client {
         on_event: ThreadsafeFunction<StreamEvent, ErrorStrategy::Fatal>,
     ) -> Result<InferenceResponse> {
         let inner = self.inner.clone();
-        let proto_req = to_proto_request(req)
+        let mut proto_req = to_proto_request(req)
             .map_err(|e| Error::from_reason(format!("bad request: {e}")))?;
+        // `to_proto_request` defaults `stream`/`progress` to false (the
+        // shape `inference` wants). The streaming entry point must flip
+        // `stream` so the server actually pushes Chunk frames — without
+        // this the callback never fires and only the final `Inference
+        // Complete` reaches us. `progress` stays off until JS callers
+        // ask for it (we surface phase via chunks today).
+        proto_req.stream = true;
         let resp = tokio::task::spawn_blocking(move || {
             inner.inference_stream(proto_req, |ev| {
                 on_event.call(rust_event_to_napi(ev), ThreadsafeFunctionCallMode::NonBlocking);
