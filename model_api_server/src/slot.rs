@@ -140,6 +140,7 @@ impl SlotHandle for StubSlot {
                 sink.on_chunk(StreamChunk {
                     delta_text: std::mem::take(&mut buf),
                     finish_reason: if i + 1 == n { Some("stop".into()) } else { None },
+                    phase: Some("text".into()),
                 });
             }
         }

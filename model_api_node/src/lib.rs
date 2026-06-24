@@ -19,7 +19,8 @@
 //! }
 //!
 //! export type StreamEvent =
-//!   | { kind: 'chunk',    deltaText: string, finishReason?: string }
+//!   | { kind: 'chunk',    deltaText: string, phase?: 'text' | 'thinking',
+//!                         finishReason?: string }
 //!   | { kind: 'progress', phase: string, tool?: string, detail?: string }
 //!
 //! export interface ToolDef {
@@ -203,6 +204,14 @@ pub struct InferenceRequest {
     /// Skip prefilling the `<think>\n` prefix. Useful for plain
     /// chat-completion APIs.
     pub disable_think_prefix: Option<bool>,
+    // ── Streaming knobs (only meaningful with inferenceStream) ──
+    /// Per-N-chars accumulator for streamed chunks. Server default
+    /// is 16 — smaller = smoother typewriter, larger = quieter wire.
+    pub stream_chunk_chars: Option<u32>,
+    /// When true, also emit `StreamEvent { kind: 'chunk', phase:
+    /// 'thinking' }` for content inside `<think>...</think>`
+    /// blocks. Default false — most UIs only render visible text.
+    pub stream_thinking: Option<bool>,
 }
 
 /// Inference response shape returned to JS.
@@ -415,6 +424,8 @@ fn to_proto_request(r: InferenceRequest) -> std::result::Result<proto::Inference
             max_tokens: r.max_tokens_override,
             system_prompt: r.system_prompt,
             tool_mode,
+            stream_chunk_chars: r.stream_chunk_chars,
+            stream_thinking: r.stream_thinking.unwrap_or(false),
         },
         tools: r.tools.unwrap_or_default().into_iter().map(to_proto_tool_def).collect(),
         tool_results: r.tool_results.unwrap_or_default().into_iter().map(to_proto_tool_result).collect(),
@@ -452,7 +463,11 @@ fn rust_event_to_napi(ev: RustStreamEvent) -> StreamEvent {
             kind: "chunk".into(),
             delta_text: Some(c.delta_text),
             finish_reason: c.finish_reason,
-            phase: None,
+            // For chunks, `phase` carries the sub-stream tag
+            // (`"text"` | `"thinking"`). For progress events it's
+            // the phase name (`"queued"` etc.). The discriminator
+            // is `kind`, not `phase`.
+            phase: c.phase,
             tool: None,
             detail: None,
         },

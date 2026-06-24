@@ -165,6 +165,20 @@ pub struct InferenceConfig {
     /// during generation. See [`ToolMode`].
     #[serde(default)]
     pub tool_mode: ToolMode,
+    /// Per-N-chars accumulator for streamed [`StreamChunk`]s. The
+    /// decoder buffers tokens until this many UTF-8 chars have
+    /// landed in the visible-text stream, then flushes a chunk.
+    /// `None` = server default (currently 16). Smaller = smoother
+    /// UI + more wire frames; larger = quieter wire. Only meaningful
+    /// when `InferenceRequest::stream` is true.
+    #[serde(default)]
+    pub stream_chunk_chars: Option<u32>,
+    /// When true, also emit `StreamChunk { phase: Some("thinking") }`
+    /// for content inside `<think>...</think>` blocks. Default
+    /// false — most UIs only want the final visible text. Has no
+    /// effect when `InferenceRequest::stream` is false.
+    #[serde(default)]
+    pub stream_thinking: bool,
 }
 
 impl Default for InferenceConfig {
@@ -179,6 +193,8 @@ impl Default for InferenceConfig {
             max_tokens: None,
             system_prompt: None,
             tool_mode: ToolMode::default(),
+            stream_chunk_chars: None,
+            stream_thinking: false,
         }
     }
 }
@@ -314,6 +330,15 @@ pub struct StreamChunk {
     pub delta_text: String,
     /// Stop signal: `None` while generating, `Some` on the last chunk.
     pub finish_reason: Option<String>,
+    /// Which sub-stream this delta belongs to. `None` and
+    /// `Some("text")` are equivalent — visible answer text the
+    /// final `InferenceResponse.text` will also contain.
+    /// `Some("thinking")` is emitted only when the request set
+    /// `inference_config.stream_thinking = true` and the model is
+    /// inside a `<think>...</think>` block; UIs typically show
+    /// these in a separate "reasoning" pane.
+    #[serde(default)]
+    pub phase: Option<String>,
 }
 
 /// Real-time progress milestone (when `InferenceRequest::progress` is

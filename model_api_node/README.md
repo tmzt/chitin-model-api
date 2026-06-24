@@ -245,7 +245,9 @@ resolves with the final `InferenceResponse` when the server emits
 
 ```ts
 type StreamEvent =
-  | { kind: 'chunk',    deltaText: string, finishReason?: string }
+  | { kind: 'chunk',    deltaText: string,
+                        phase?: 'text' | 'thinking',
+                        finishReason?: string }
   | { kind: 'progress', phase: string, tool?: string, detail?: string }
 
 inferenceStream(
@@ -253,6 +255,16 @@ inferenceStream(
   onEvent: (event: StreamEvent) => void,
 ): Promise<InferenceResponse>
 ```
+
+**Chunk `phase` field**: `'text'` (or omitted) = visible answer
+that ends up in the final `response.text`. `'thinking'` = content
+from inside `<think>...</think>` reasoning blocks, only emitted
+when `request.streamThinking === true`. UIs typically render
+thinking deltas in a separate "reasoning" pane.
+
+**Chunk size** is controlled by `request.streamChunkChars` (server
+default: 16). Smaller = smoother typewriter UI + more wire frames;
+larger = quieter wire.
 
 ```js
 let answer = '';
@@ -277,11 +289,13 @@ a slow JS handler can't stall the inference loop, but events queue
 in libuv if you over-feed the event loop. The server is single-slot
 so this matters more for correctness than throughput.
 
-Backend status: chunks + progress events flow end-to-end through the
-`StubSlot`. For the real `LlamaSlot`, only progress events fire
-today (from the in-band tool dispatcher); incremental chunks are a
-TODO inside `thinker_impl::llama_slot`. The promise still resolves
-with the final response either way.
+Backend status: chunks + progress events flow end-to-end through
+both the `StubSlot` and the real `LlamaSlot`. The llama backend
+emits chunks per-N-chars from inside `generate_with_channels`'s
+state machine — visible text comes through as `phase: 'text'`,
+reasoning content (when `streamThinking: true`) as
+`phase: 'thinking'`, with a terminal `{ finishReason: 'stop',
+deltaText: '' }` chunk to mark end-of-stream.
 
 ### `client.cancel(): Promise<void>`
 

@@ -42,7 +42,7 @@ use model_api_proto::{
 };
 use thinker_impl::ThinkerConfig;
 
-use crate::slot::{SlotHandle, SlotRequest, SlotResponse};
+use crate::slot::{SlotHandle, SlotRequest, SlotResponse, StreamSink};
 
 /// SlotHandle backed by `thinker_impl::spawn_resource`.
 ///
@@ -115,6 +115,29 @@ impl SlotHandle for LlamaSlot {
     fn gpu_memory_mb(&self) -> Option<u32> { self.resource.gpu_memory_mb() }
 
     async fn run(&self, req: SlotRequest) -> Result<SlotResponse, String> {
+        self.run_inner(req, None).await
+    }
+
+    async fn run_stream(
+        &self,
+        req: SlotRequest,
+        sink: &dyn StreamSink,
+    ) -> Result<SlotResponse, String> {
+        self.run_inner(req, Some(sink)).await
+    }
+}
+
+impl LlamaSlot {
+    /// Unified implementation: when `sink` is `Some`, builds an
+    /// async_channel pair, plumbs the sender into ThinkerRequest.
+    /// stream_tx + progress_tx, and spawns a drain task that
+    /// forwards each event to the sink. When `sink` is `None`, the
+    /// channels stay `None` and the slot behaves as before.
+    async fn run_inner(
+        &self,
+        req: SlotRequest,
+        sink: Option<&dyn StreamSink>,
+    ) -> Result<SlotResponse, String> {
         let SlotRequest { req } = req;
 
         // Decide tool-dispatch mode up front so we know whether to
@@ -162,14 +185,31 @@ impl SlotHandle for LlamaSlot {
         // Channel for the slot to drop its single response into.
         let (resp_tx, resp_rx) = smol::channel::bounded::<common::handles::ThinkerResponse>(1);
 
+        // Streaming wiring: only set up the chunk + progress
+        // channels when a sink is supplied. The channels driver
+        // skips chunk emission entirely on a None stream_tx, so
+        // non-streaming requests stay zero-overhead.
+        let (stream_tx, stream_rx) = if sink.is_some() {
+            let (tx, rx) = async_channel::bounded::<common::handles::StreamChunk>(64);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let (progress_tx, progress_rx) = if sink.is_some() {
+            let (tx, rx) = async_channel::bounded::<common::handles::ProgressEvent>(64);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let thinker_req = ThinkerRequest {
             role: to_common_role(req.role),
             input: CommonInput::Text(prompt),
             max_tokens: req.max_tokens as usize,
             response_tx: resp_tx,
             session: to_common_session(req.session),
-            stream_tx: None,
-            progress_tx: None,
+            stream_tx,
+            progress_tx,
             prefix_cache: None,
             disable_think_prefix: req.inference_config.disable_think_prefix,
             inference_config: common_cfg,
@@ -181,8 +221,41 @@ impl SlotHandle for LlamaSlot {
             return Err(format!("slot channel closed: {e}"));
         }
 
-        let common_resp = resp_rx.recv().await
-            .map_err(|e| format!("slot response channel closed: {e}"))?;
+        // Streaming flow: poll the response channel while draining
+        // pending chunk + progress events into the sink. Yields
+        // between try_recv attempts so the slot thread and event
+        // emitters can make progress.
+        //
+        // Non-streaming flow: a plain await on resp_rx — the
+        // channels are None and nothing else competes for cycles.
+        let common_resp = match (stream_rx.as_ref(), progress_rx.as_ref(), sink) {
+            (Some(srx), Some(prx), Some(sink_ref)) => {
+                let resp = loop {
+                    drain_chunks(srx, sink_ref);
+                    drain_progress(prx, sink_ref);
+                    match resp_rx.try_recv() {
+                        Ok(r) => break r,
+                        Err(async_channel::TryRecvError::Empty) => {
+                            smol::future::yield_now().await;
+                        }
+                        Err(async_channel::TryRecvError::Closed) => {
+                            return Err("slot response channel closed".into());
+                        }
+                    }
+                };
+                // Tail drain. The channels driver emits its final
+                // "stop" chunk AFTER pushing the ThinkerResponse,
+                // so a client that grabs the response and stops
+                // listening would miss it without this loop.
+                drain_chunks(srx, sink_ref);
+                drain_progress(prx, sink_ref);
+                resp
+            }
+            _ => {
+                resp_rx.recv().await
+                    .map_err(|e| format!("slot response channel closed: {e}"))?
+            }
+        };
 
         // Extract tool calls from the raw model output when we're in
         // client-dispatch mode. The channels driver leaves markers
@@ -206,6 +279,28 @@ impl SlotHandle for LlamaSlot {
                 input: r.input,
             }),
         }))
+    }
+}
+
+// ── Streaming drain helpers ─────────────────────────────────────────
+
+fn drain_chunks(rx: &async_channel::Receiver<common::handles::StreamChunk>, sink: &dyn StreamSink) {
+    while let Ok(c) = rx.try_recv() {
+        sink.on_chunk(model_api_proto::StreamChunk {
+            delta_text: c.delta_text,
+            finish_reason: c.finish_reason,
+            phase: c.phase,
+        });
+    }
+}
+
+fn drain_progress(rx: &async_channel::Receiver<common::handles::ProgressEvent>, sink: &dyn StreamSink) {
+    while let Ok(p) = rx.try_recv() {
+        sink.on_progress(model_api_proto::ProgressEvent {
+            phase: p.phase,
+            tool: p.tool,
+            detail: p.detail,
+        });
     }
 }
 
