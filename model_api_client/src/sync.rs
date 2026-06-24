@@ -25,6 +25,30 @@ use model_api_proto::{
     ServerMessage, StreamChunk, PROTOCOL_VERSION,
 };
 
+/// Unified event the server emits during a streaming inference.
+/// Mirrors the JS `StreamEvent` discriminated union exposed by the
+/// Node bindings (`{ type: 'chunk' | 'progress', ... }`). The wire
+/// format keeps the two frame variants separate for clean bincode
+/// discrimination; this enum is the Rust-side convenience surface
+/// for callback consumers.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Incremental text from the decoder.
+    Chunk(StreamChunk),
+    /// Progress milestone from the slot / dispatcher.
+    Progress(ProgressEvent),
+}
+
+impl StreamEvent {
+    /// `"chunk"` or `"progress"` — matches the JS `type` field.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            StreamEvent::Chunk(_) => "chunk",
+            StreamEvent::Progress(_) => "progress",
+        }
+    }
+}
+
 use crate::framed::{encode, MAX_FRAME_BYTES};
 use crate::ClientError;
 
@@ -127,18 +151,22 @@ impl SyncClient {
         }
     }
 
-    /// Submit an inference with callbacks for streaming chunks +
-    /// progress events. Same semantics as [`inference`] for the
-    /// final response; the callbacks fire from this thread (the one
-    /// calling `inference_stream`) before each Chunk / Progress
-    /// frame is dropped. Use this when the caller wants to display
-    /// tokens as they arrive (e.g. a chat UI).
+    /// Submit an inference with a single callback for streaming
+    /// chunks + progress events. The callback fires on this thread
+    /// (the one calling `inference_stream`) for each intermediate
+    /// frame, then the final `InferenceResponse` is returned.
+    ///
+    /// Sets [`InferenceRequest::stream`] and [`progress`] to `true`
+    /// so the server actually emits the events — caller doesn't need
+    /// to flip those bits themselves.
     pub fn inference_stream(
         &self,
-        req: InferenceRequest,
-        mut on_chunk: impl FnMut(StreamChunk),
-        mut on_progress: impl FnMut(ProgressEvent),
+        mut req: InferenceRequest,
+        mut on_event: impl FnMut(StreamEvent),
     ) -> Result<InferenceResponse, ClientError> {
+        req.stream = true;
+        req.progress = true;
+
         let mut guard = self.stream.lock()
             .map_err(|_| ClientError::Io("client mutex poisoned".into()))?;
 
@@ -150,12 +178,33 @@ impl SyncClient {
                 Some(ServerMessage::InferenceError { message }) => {
                     return Err(ClientError::Server(message));
                 }
-                Some(ServerMessage::Chunk(c)) => on_chunk(c),
-                Some(ServerMessage::Progress(p)) => on_progress(p),
+                Some(ServerMessage::Chunk(c)) => on_event(StreamEvent::Chunk(c)),
+                Some(ServerMessage::Progress(p)) => on_event(StreamEvent::Progress(p)),
                 Some(ServerMessage::Hello { .. }) | Some(ServerMessage::Goodbye) => {}
                 None => return Err(ClientError::Disconnected),
             }
         }
+    }
+
+    /// Best-effort cancel of the in-flight inference on this
+    /// connection. Sends one `ClientMessage::Cancel` frame and
+    /// returns immediately — does **not** wait for the server's
+    /// response. The thread blocked on `inference` / `inference_stream`
+    /// either receives an `InferenceError { message: "cancelled" }`
+    /// (returned as `ClientError::Server`) or sees the read half close
+    /// (`ClientError::Disconnected`), depending on how the server
+    /// chose to honour the cancel.
+    ///
+    /// Server-side cancel routing is a TODO today — the server logs
+    /// the frame but doesn't actually interrupt the slot. The Node
+    /// bindings expose this method now so callers can wire
+    /// `AbortSignal` cleanly; once the server honours cancel, no
+    /// JS changes are needed.
+    pub fn cancel(&self) -> Result<(), ClientError> {
+        let mut guard = self.stream.lock()
+            .map_err(|_| ClientError::Io("client mutex poisoned".into()))?;
+        write_frame(&mut *guard, &ClientMessage::Cancel)?;
+        Ok(())
     }
 
     /// Close this client's connection.

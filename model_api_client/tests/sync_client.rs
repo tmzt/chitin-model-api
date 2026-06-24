@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use model_api_client::SyncClient;
+use model_api_client::{SyncClient, sync::StreamEvent};
 use model_api_proto::{
     GpuRole, InferenceConfig, InferenceInput, InferenceRequest, SessionMode,
     ToolDef, ToolMode, ToolParam, ToolResult,
@@ -162,6 +162,81 @@ fn tool_results_round_trip_through_request_field() {
     assert_eq!(r.text, "echo: here's the result");
     assert_eq!(r.session_id.as_deref(), Some("s-tres"));
     assert_eq!(r.tool_calls.len(), 0);
+}
+
+#[test]
+fn inference_stream_receives_chunks_progress_and_final() {
+    // Wire-side streaming test: StubSlot's run_stream emits a
+    // canned sequence of Progress + Chunk events around its echoed
+    // response. The test collects events into a buffer (the napi
+    // bindings will do the same via ThreadsafeFunction) and asserts
+    // ordering + completeness.
+    let socket = ephemeral_socket("strm");
+    spawn_server(&socket);
+    wait_for_socket(&socket);
+
+    let client = SyncClient::connect(&socket).expect("connect");
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<StreamEvent>::new()));
+    let ev = events.clone();
+    let resp = client
+        .inference_stream(req("hello streaming", "s-strm"), move |e| {
+            ev.lock().unwrap().push(e);
+        })
+        .expect("inference_stream");
+
+    assert_eq!(resp.text, "echo: hello streaming");
+
+    let collected = events.lock().unwrap();
+    // Expect at least: 2 progress (queued + gen_start) + 1+ chunk
+    // + 1 progress (gen_done). StubSlot splits the text into ~3
+    // chunks; exact count depends on length math but >=1 chunk is
+    // the contract.
+    let chunk_count = collected.iter().filter(|e| e.kind() == "chunk").count();
+    let progress_count = collected.iter().filter(|e| e.kind() == "progress").count();
+    assert!(
+        chunk_count >= 1,
+        "expected at least 1 chunk event, got {chunk_count} (events={collected:?})"
+    );
+    assert!(
+        progress_count >= 2,
+        "expected at least 2 progress events, got {progress_count} (events={collected:?})"
+    );
+
+    // First event should be a `queued` progress, last a `gen_done`.
+    if let Some(StreamEvent::Progress(p)) = collected.first() {
+        assert_eq!(p.phase, "queued");
+    } else {
+        panic!("first event should be Progress(queued), got {:?}", collected.first());
+    }
+    if let Some(StreamEvent::Progress(p)) = collected.last() {
+        assert_eq!(p.phase, "gen_done");
+    } else {
+        panic!("last event should be Progress(gen_done), got {:?}", collected.last());
+    }
+
+    // Concatenated chunk deltas should reconstruct the full text.
+    let reconstructed: String = collected.iter().filter_map(|e| match e {
+        StreamEvent::Chunk(c) => Some(c.delta_text.clone()),
+        _ => None,
+    }).collect();
+    assert_eq!(reconstructed, resp.text);
+}
+
+#[test]
+fn cancel_sends_one_frame_and_returns_immediately() {
+    // Smoke test that the wire frame goes out cleanly. The server
+    // logs it but doesn't act today (cancellation is a TODO inside
+    // the slot loop) — what we're verifying is the SyncClient
+    // surface so napi bindings can wrap it for AbortSignal.
+    let socket = ephemeral_socket("cancl");
+    spawn_server(&socket);
+    wait_for_socket(&socket);
+
+    let client = SyncClient::connect(&socket).expect("connect");
+    client.cancel().expect("cancel");
+    // No assertion on server behaviour; if cancel ever returned an
+    // error we'd want to know.
 }
 
 #[test]

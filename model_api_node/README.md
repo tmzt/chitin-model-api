@@ -236,6 +236,69 @@ for (let turn = 0; turn < 5; turn++) {
 await c.shutdown();
 ```
 
+### `client.inferenceStream(req, onEvent): Promise<InferenceResponse>`
+
+Same request shape as `inference`, but the server pushes
+`StreamEvent`s through `onEvent` as the inference runs. The Promise
+resolves with the final `InferenceResponse` when the server emits
+`InferenceComplete`.
+
+```ts
+type StreamEvent =
+  | { kind: 'chunk',    deltaText: string, finishReason?: string }
+  | { kind: 'progress', phase: string, tool?: string, detail?: string }
+
+inferenceStream(
+  req: InferenceRequest,
+  onEvent: (event: StreamEvent) => void,
+): Promise<InferenceResponse>
+```
+
+```js
+let answer = '';
+const final = await client.inferenceStream(req, (event) => {
+  if (event.kind === 'chunk') {
+    process.stdout.write(event.deltaText);
+    answer += event.deltaText;
+  } else if (event.kind === 'progress') {
+    // event.phase ∈ {'queued','dispatched','tool_start','tool_end',
+    //                'gen_start','gen_done', …future-defined}
+    console.log(`progress: ${event.phase}`);
+  }
+});
+// `final.text` reconstructs to `answer` for the StubSlot.  For
+// real models, the chunks may include intermediate `<think>` tokens
+// that the final `text` strips — use `rawText` if you need the
+// full stream.
+```
+
+Callbacks fire from the libuv thread with `NonBlocking` semantics —
+a slow JS handler can't stall the inference loop, but events queue
+in libuv if you over-feed the event loop. The server is single-slot
+so this matters more for correctness than throughput.
+
+Backend status: chunks + progress events flow end-to-end through the
+`StubSlot`. For the real `LlamaSlot`, only progress events fire
+today (from the in-band tool dispatcher); incremental chunks are a
+TODO inside `thinker_impl::llama_slot`. The promise still resolves
+with the final response either way.
+
+### `client.cancel(): Promise<void>`
+
+Best-effort cancel of the in-flight inference. Sends one `Cancel`
+frame and resolves immediately. The active `inference` /
+`inferenceStream` promise then either resolves with whatever the
+server decided to return, or rejects with the server's
+`InferenceError`. Server-side cancel honour is a TODO (the server
+logs the frame today); the binding ships now so JS callers don't
+need to change once the server-side wakes up.
+
+Pair with `AbortSignal`:
+
+```js
+options.signal?.addEventListener('abort', () => client.cancel());
+```
+
 ### `client.shutdown(): Promise<void>`
 
 Close this client's connection. Does **not** shut down the server —
@@ -278,15 +341,6 @@ on UDS I/O. The Rust side holds a single `Mutex<UnixStream>` per
 
 If you want parallel inflight requests from JS, open multiple
 `Client`s; each gets its own queue position with the server.
-
-## Streaming + progress (not yet wired)
-
-The wire protocol carries `Chunk` and `Progress` frames for
-streaming token output and real-time progress events; the Node
-bindings currently drain them silently while waiting for
-`InferenceComplete`. Surfacing them as a callback or
-`AsyncIterator` is a follow-up — search for the `TODO` notes in
-`src/lib.rs` once you want it.
 
 ## Wire protocol
 

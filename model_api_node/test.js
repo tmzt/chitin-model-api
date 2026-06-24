@@ -74,6 +74,33 @@ const SOCKET = process.argv[2] || '/tmp/chitin-model-api.sock';
     console.log(`  text: ${JSON.stringify(r3.text)}`);
   }
 
+  // ── Streaming ─────────────────────────────────────────────────────
+  console.log('\n[4] streaming inference (chunks + progress):');
+  const buf = [];
+  const r4 = await c.inferenceStream(
+    {
+      role: 'deep',
+      input: 'tell me a fact',
+      maxTokens: 64,
+      sessionId: 's-node-test-stream',
+    },
+    (event) => {
+      if (event.kind === 'chunk') {
+        process.stdout.write(event.deltaText);
+        buf.push(event.deltaText);
+      } else if (event.kind === 'progress') {
+        console.log(`\n  [progress] ${event.phase}${event.detail ? ` (${event.detail})` : ''}`);
+      }
+    },
+  );
+  console.log(`\n  final text: ${JSON.stringify(r4.text)}`);
+  console.log(`  reconstructed from chunks: ${JSON.stringify(buf.join(''))}`);
+
+  // ── Cancel (best-effort smoke) ────────────────────────────────────
+  console.log('\n[5] cancel() smoke test (no-op server-side today):');
+  await c.cancel();
+  console.log('  cancel() returned cleanly');
+
   await c.shutdown();
   console.log('\nshutdown complete');
 })().catch((e) => {

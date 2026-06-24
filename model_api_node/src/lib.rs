@@ -10,8 +10,17 @@
 //!   readonly gpuMemoryMb: number | null
 //!   readonly protocolVersion: number
 //!   inference(req: InferenceRequest): Promise<InferenceResponse>
+//!   inferenceStream(
+//!     req: InferenceRequest,
+//!     onEvent: (event: StreamEvent) => void,
+//!   ): Promise<InferenceResponse>
+//!   cancel(): Promise<void>
 //!   shutdown(): Promise<void>
 //! }
+//!
+//! export type StreamEvent =
+//!   | { kind: 'chunk',    deltaText: string, finishReason?: string }
+//!   | { kind: 'progress', phase: string, tool?: string, detail?: string }
 //!
 //! export interface ToolDef {
 //!   name: string
@@ -62,9 +71,11 @@
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, ErrorStrategy};
 use napi_derive::napi;
 
 use model_api_client::SyncClient;
+use model_api_client::sync::StreamEvent as RustStreamEvent;
 use model_api_proto as proto;
 
 // ── Wire-shape mirrors (JS-friendly camelCase + Strings) ────────────
@@ -112,6 +123,34 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub call_id: String,
     pub output: String,
+}
+
+/// Event the server emits during a streaming inference.
+/// Discriminated by `kind`:
+///   `{ kind: 'chunk',    deltaText: string, finishReason?: string }`
+///   `{ kind: 'progress', phase: string, tool?: string, detail?: string }`
+///
+/// TypeScript consumers narrow on `event.kind`. All non-applicable
+/// fields are `null` for the other variant — napi-rs flat-object
+/// macro can't express a real discriminated union without manual
+/// JSON encoding; the kind tag + nullable fields is the canonical
+/// napi pattern.
+#[napi(object)]
+pub struct StreamEvent {
+    pub kind: String,
+    /// Set when `kind === 'chunk'`.
+    pub delta_text: Option<String>,
+    /// Set when `kind === 'chunk'`; present only on the final chunk.
+    pub finish_reason: Option<String>,
+    /// Set when `kind === 'progress'`. One of `'queued'`,
+    /// `'dispatched'`, `'tool_start'`, `'tool_end'`, `'gen_start'`,
+    /// `'gen_done'`, or any future server-defined value — treat
+    /// unknown phases as informational.
+    pub phase: Option<String>,
+    /// Tool name for tool-related progress phases.
+    pub tool: Option<String>,
+    /// Free-form descriptive detail (e.g. token count).
+    pub detail: Option<String>,
 }
 
 /// Inference request as seen from JS. Mirrors
@@ -250,6 +289,62 @@ impl Client {
         Ok(from_proto_response(resp))
     }
 
+    /// Submit one inference request with streaming events. Calls
+    /// `onEvent` from the libuv thread for each `StreamEvent`
+    /// emitted by the server (chunks + progress milestones); the
+    /// returned Promise resolves with the final `InferenceResponse`
+    /// once the server emits its `InferenceComplete` frame.
+    ///
+    /// Backpressure: events fire `NonBlocking` so a slow JS
+    /// handler can't stall the inference loop. The server is
+    /// single-slot and inference is slow compared to JS event-loop
+    /// turnaround, so this matters more for correctness than
+    /// throughput.
+    #[napi]
+    pub async fn inference_stream(
+        &self,
+        req: InferenceRequest,
+        on_event: ThreadsafeFunction<StreamEvent, ErrorStrategy::Fatal>,
+    ) -> Result<InferenceResponse> {
+        let inner = self.inner.clone();
+        let proto_req = to_proto_request(req)
+            .map_err(|e| Error::from_reason(format!("bad request: {e}")))?;
+        let resp = tokio::task::spawn_blocking(move || {
+            inner.inference_stream(proto_req, |ev| {
+                on_event.call(rust_event_to_napi(ev), ThreadsafeFunctionCallMode::NonBlocking);
+            })
+        })
+            .await
+            .map_err(|e| Error::from_reason(format!("join: {e}")))?
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        Ok(from_proto_response(resp))
+    }
+
+    /// Best-effort cancel of the in-flight inference. Sends one
+    /// `Cancel` frame and resolves immediately — does NOT wait for
+    /// the server's response. The `inference` / `inferenceStream`
+    /// promise then either resolves with whatever the server
+    /// chose to return, or rejects with an `InferenceError`. Wire
+    /// `AbortSignal` to this for clean abort flows:
+    ///
+    /// ```js
+    /// options.signal?.addEventListener('abort', () => client.cancel());
+    /// ```
+    ///
+    /// Server-side cancel routing is a TODO today (the server
+    /// logs the frame but doesn't interrupt the slot). The
+    /// binding is shipped now so JS callers don't need to change
+    /// once the server-side honours it.
+    #[napi]
+    pub async fn cancel(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.cancel())
+            .await
+            .map_err(|e| Error::from_reason(format!("join: {e}")))?
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        Ok(())
+    }
+
     /// Close this client's connection. Does NOT shut down the
     /// server — the slot's reference count drops by one; other
     /// clients (and the server process) continue. Resolves once
@@ -346,6 +441,30 @@ fn to_proto_tool_def(t: ToolDef) -> proto::ToolDef {
 
 fn to_proto_tool_result(r: ToolResult) -> proto::ToolResult {
     proto::ToolResult { call_id: r.call_id, output: r.output }
+}
+
+/// Convert a Rust-side `StreamEvent` to the napi flat-object shape.
+/// Nulls all fields that don't apply to the variant — the JS side
+/// narrows on `kind`.
+fn rust_event_to_napi(ev: RustStreamEvent) -> StreamEvent {
+    match ev {
+        RustStreamEvent::Chunk(c) => StreamEvent {
+            kind: "chunk".into(),
+            delta_text: Some(c.delta_text),
+            finish_reason: c.finish_reason,
+            phase: None,
+            tool: None,
+            detail: None,
+        },
+        RustStreamEvent::Progress(p) => StreamEvent {
+            kind: "progress".into(),
+            delta_text: None,
+            finish_reason: None,
+            phase: Some(p.phase),
+            tool: p.tool,
+            detail: p.detail,
+        },
+    }
 }
 
 fn from_proto_response(r: proto::InferenceResponse) -> InferenceResponse {

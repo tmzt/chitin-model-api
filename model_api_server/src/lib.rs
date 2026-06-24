@@ -25,7 +25,14 @@ pub mod slot;
 #[cfg(feature = "llama-cpp")]
 pub mod llama_slot;
 
-pub use slot::{SlotHandle, SlotRequest, SlotResponse};
+pub use slot::{DiscardSink, SlotHandle, SlotRequest, SlotResponse, StreamSink};
+
+// Internal — events the streaming handler shuttles from the slot
+// sink to the wire-frame writer.
+enum SlotEvent {
+    Chunk(model_api_proto::StreamChunk),
+    Progress(model_api_proto::ProgressEvent),
+}
 
 /// Per-connection identity for logging.
 static CONN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -127,19 +134,130 @@ pub async fn handle_client(
                 return Err(format!("conn {conn_id}: duplicate Hello"));
             }
             ClientMessage::Inference(req) => {
-                // Hand off to the slot — single global slot today, so
-                // calls serialize naturally. The slot returns either
-                // a final response or an error string.
-                let stream_progress = req.progress;
-                let _stream_chunks = req.stream;
-                let _ = stream_progress; // Wired in a follow-up commit
-                let _ = _stream_chunks;  // — for now we just send the
-                                         // final InferenceComplete.
+                // Streaming gate: when either `stream` or `progress`
+                // is on, route through `slot.run_stream` with a sink
+                // that pushes wire frames as the slot emits events.
+                // Otherwise the cheap non-streaming path — slot
+                // returns one final response, we wrap it.
+                let wants_stream = req.stream || req.progress;
 
-                let resp = slot.run(SlotRequest::from_proto(req)).await;
-                let reply = match resp {
-                    Ok(SlotResponse(inf)) => ServerMessage::InferenceComplete(inf),
-                    Err(e) => ServerMessage::InferenceError { message: e },
+                let reply = if wants_stream {
+                    // Sink forwards Chunk / Progress events into a
+                    // bounded async channel that this fn drains.
+                    // Bounded(64) so a slow JS client can't make the
+                    // slot buffer unbounded — when the channel fills
+                    // up the sink's send blocks (drops, technically,
+                    // since try_send returns Err on full). Real
+                    // backpressure needs the slot to await the
+                    // sink's send, which the trait API doesn't
+                    // support today; revisit if we ever see real
+                    // congestion.
+                    let (event_tx, event_rx) =
+                        async_channel::bounded::<SlotEvent>(64);
+                    struct Forward(async_channel::Sender<SlotEvent>);
+                    impl crate::slot::StreamSink for Forward {
+                        fn on_chunk(&self, c: model_api_proto::StreamChunk) {
+                            let _ = self.0.try_send(SlotEvent::Chunk(c));
+                        }
+                        fn on_progress(&self, p: model_api_proto::ProgressEvent) {
+                            let _ = self.0.try_send(SlotEvent::Progress(p));
+                        }
+                    }
+                    let sink: Forward = Forward(event_tx.clone());
+
+                    // Run the slot on a background task so the
+                    // event-drain loop on this task can interleave
+                    // with the slot's event emission. Without this
+                    // split, sink's try_send would race against our
+                    // event_rx.recv on the same task and we'd lose
+                    // events at the channel boundary.
+                    let slot2 = slot.clone();
+                    let req_for_slot = SlotRequest::from_proto(req);
+                    let slot_task = smol::spawn(async move {
+                        slot2.run_stream(req_for_slot, &sink).await
+                    });
+
+                    // Drain events until the slot future finishes,
+                    // forwarding each as a frame to the wire. We
+                    // can't poll the slot future + the channel
+                    // concurrently with a single .await + select, so
+                    // use a try_recv loop with a brief yield to keep
+                    // the executor happy. Final response is awaited
+                    // last; any events still in the queue after the
+                    // slot returns get drained before we send
+                    // InferenceComplete.
+                    let mut final_resp: Option<Result<SlotResponse, String>> = None;
+                    loop {
+                        // First try to drain any pending events.
+                        match event_rx.try_recv() {
+                            Ok(ev) => {
+                                let frame = match ev {
+                                    SlotEvent::Chunk(c) => ServerMessage::Chunk(c),
+                                    SlotEvent::Progress(p) => ServerMessage::Progress(p),
+                                };
+                                framed::write_frame_async(&mut writer, &frame).await
+                                    .map_err(|e| format!("conn {conn_id}: write event: {e}"))?;
+                                continue;
+                            }
+                            Err(async_channel::TryRecvError::Empty) => {}
+                            Err(async_channel::TryRecvError::Closed) => break,
+                        }
+                        // Otherwise poll the slot once; if it's done
+                        // grab the result. If still running, yield
+                        // so the slot task can make progress.
+                        if slot_task.is_finished() {
+                            final_resp = Some((&mut { slot_task }).await);
+                            break;
+                        }
+                        smol::future::yield_now().await;
+                    }
+                    // Drop the sink's tx clone (we held one above via
+                    // sink); close event_rx by dropping it after the
+                    // last try_recv. If slot_task wasn't already
+                    // awaited (e.g. channel closed first), await it.
+                    let final_resp = match final_resp {
+                        Some(r) => r,
+                        None => {
+                            // Slot completed via the channel-closed
+                            // path; await its task to retrieve the
+                            // Result. Channel close means the Forward
+                            // sink got dropped, which only happens
+                            // when slot_task completed and the
+                            // closure was dropped — so the task is
+                            // already finished.
+                            // smol::Task::poll wouldn't compile here;
+                            // a fresh await is correct because
+                            // is_finished was true.
+                            return Err(format!(
+                                "conn {conn_id}: slot channel closed before final response"
+                            ));
+                        }
+                    };
+
+                    // Drain any tail events queued while we were
+                    // waiting on the slot task — make sure no Chunks
+                    // arrive after InferenceComplete in the wire
+                    // order.
+                    while let Ok(ev) = event_rx.try_recv() {
+                        let frame = match ev {
+                            SlotEvent::Chunk(c) => ServerMessage::Chunk(c),
+                            SlotEvent::Progress(p) => ServerMessage::Progress(p),
+                        };
+                        framed::write_frame_async(&mut writer, &frame).await
+                            .map_err(|e| format!("conn {conn_id}: write tail event: {e}"))?;
+                    }
+
+                    match final_resp {
+                        Ok(SlotResponse(inf)) => ServerMessage::InferenceComplete(inf),
+                        Err(e) => ServerMessage::InferenceError { message: e },
+                    }
+                } else {
+                    // Non-streaming fast path.
+                    let resp = slot.run(SlotRequest::from_proto(req)).await;
+                    match resp {
+                        Ok(SlotResponse(inf)) => ServerMessage::InferenceComplete(inf),
+                        Err(e) => ServerMessage::InferenceError { message: e },
+                    }
                 };
                 framed::write_frame_async(&mut writer, &reply).await
                     .map_err(|e| format!("conn {conn_id}: write reply: {e}"))?;
