@@ -13,10 +13,18 @@
 use model_api_proto::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 
 pub mod framed;
+pub mod sync;
 
 // Re-export the proto types so downstream callers only need to depend
 // on this crate, not directly on `model_api_proto`.
 pub use model_api_proto as proto;
+
+// Re-export the sync client as the canonical surface — it's what
+// the Node bindings (model_api_node), the openai-api shim, and
+// anything else without a smol reactor uses. The async-shaped
+// `Client` below is kept for code paths that already have a smol
+// reactor running (e.g. thinker_impl's bridge thread).
+pub use sync::SyncClient;
 
 /// Errors the client can return at the API surface. Wire-level
 /// failures (codec decode, socket read/write) fold into `Io`; the

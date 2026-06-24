@@ -15,3 +15,9 @@ smol = "2"
 async-channel = "2"
 futures-lite = "2"
 log = "0.4"
+
+[dev-dependencies]
+# Integration test (`tests/sync_client.rs`) spins up a real server
+# with the StubSlot to exercise SyncClient end-to-end. Default
+# features off so we don't pull llama-cpp into the dep tree.
+model_api_server = { path = "../model_api_server", default-features = false }
