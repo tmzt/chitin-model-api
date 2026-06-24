@@ -1,0 +1,43 @@
+[package]
+name = "model_api_node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Node.js (N-API) bindings for `model_api_client`. Produces a
+# `.node` native module via napi-rs that JavaScript imports:
+#
+#   const { Client } = require('@chitin/model-api');
+#   const c = await Client.connect('/tmp/chitin-model-api.sock');
+#   const r = await c.inference({ role: 'deep', input: 'hi', maxTokens: 64 });
+#
+# Builds with `cd model_api_node && npm install && npm run build`
+# (or `napi build --release` if napi-cli is installed globally).
+#
+# Threading model: each napi method wraps a sync SyncClient call in
+# tokio::task::spawn_blocking, returning a JS Promise. The server
+# is single-slot, so we don't need a fancier async story.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+model_api_proto = { path = "../model_api_proto" }
+model_api_client = { path = "../model_api_client" }
+napi = { version = "2", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
+napi-derive = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# spawn_blocking lives on tokio::task; napi-rs ships an embedded
+# tokio runtime via the `tokio_rt` feature but doesn't re-export
+# the crate, so we pull it directly. Only the `rt` feature is
+# needed — napi-rs owns the runtime.
+tokio = { version = "1", features = ["rt"] }
+
+[build-dependencies]
+napi-build = "2"
+
+# NOTE: release-profile LTO would live at the workspace root, not
+# here — cargo ignores profile sections in member crates. Add to
+# /Cargo.toml when shipping prebuilt binaries if the size/perf
+# difference matters.
