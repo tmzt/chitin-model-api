@@ -359,7 +359,20 @@ pub(crate) fn extract_tool_calls(text: &str, tool_format: &dyn ToolFormat) -> Ve
         let body = &text[body_start..body_start + end];
         cursor = body_start + end + close.len();
         if let Some(parsed) = tool_format.parse_body(body) {
-            let args_json = serde_json::to_string(&parsed.args)
+            // `Gemma4ToolFormat::parse_body` (and other in-process
+            // formats) inject a redundant `tool: <name>` key into args
+            // as a sentinel for the in-process EpiphanyDispatcher. For
+            // wire callers that's noise — remote tool runtimes
+            // (pi-ai's TypeBox validators, OpenAI-style function
+            // callers, etc.) typically reject unknown args fields and
+            // refuse to dispatch. Strip it at the boundary so the
+            // wire payload only contains what the caller's schema
+            // expects.
+            let mut args = parsed.args;
+            if let Some(obj) = args.as_object_mut() {
+                obj.remove("tool");
+            }
+            let args_json = serde_json::to_string(&args)
                 .unwrap_or_else(|_| "{}".to_string());
             calls.push(ToolCall {
                 id: format!("tc-{}", calls.len()),
