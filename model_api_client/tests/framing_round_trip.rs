@@ -46,6 +46,8 @@ fn round_trips_three_frames_over_unix_stream() {
                     max_tokens: 64,
                     session: SessionMode::Persistent { session_id: "s-1".into() },
                     inference_config: InferenceConfig::default(),
+                    tools: Vec::new(),
+                    tool_results: Vec::new(),
                     cache_hash: 0xDEADBEEF,
                     stream: true,
                     progress: false,

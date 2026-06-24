@@ -12,12 +12,35 @@
 //!   inference(req: InferenceRequest): Promise<InferenceResponse>
 //!   shutdown(): Promise<void>
 //! }
+//!
+//! export interface ToolDef {
+//!   name: string
+//!   description: string
+//!   parameters: { name: string; type: string; required: boolean; description: string }[]
+//! }
+//! export interface ToolCall { id: string; name: string; argumentsJson: string }
+//! export interface ToolResult { callId: string; output: string }
+//!
+//! export type ToolMode = 'auto' | 'server' | 'client'
+//! export type JsonMode = 'none' | 'tool-only' | 'thinking-with-tools' |
+//!                        'any-json' | 'notes-classifier-json'
+//!
 //! export interface InferenceRequest {
 //!   role: 'fast' | 'deep' | 'asr' | 'omni'
 //!   input: string                  // text only for now
 //!   maxTokens: number
 //!   sessionId?: string             // omit → Stateless
-//!   cacheHash?: number             // bigint (u64)
+//!   cacheHash?: bigint             // u64
+//!   tools?: ToolDef[]              // tools the model can call this turn
+//!   toolResults?: ToolResult[]     // results from prior turn's tool calls
+//!   toolMode?: ToolMode            // default 'auto'
+//!   temperature?: number
+//!   topP?: number
+//!   repPenalty?: number
+//!   presencePenalty?: number
+//!   maxTokensOverride?: number
+//!   systemPrompt?: string
+//!   jsonMode?: JsonMode            // default 'none'
 //!   disableThinkPrefix?: boolean
 //! }
 //! export interface InferenceResponse {
@@ -25,6 +48,7 @@
 //!   sessionId?: string
 //!   rawText?: string
 //!   injections: string[]
+//!   toolCalls: ToolCall[]
 //! }
 //! ```
 //!
@@ -45,11 +69,54 @@ use model_api_proto as proto;
 
 // ── Wire-shape mirrors (JS-friendly camelCase + Strings) ────────────
 
-/// Inference request as seen from JS. Mirrors a subset of
-/// `model_api_proto::InferenceRequest`: only the bits that make
-/// sense to expose to a script. Streaming + progress are TODOs —
-/// when wired, they'd take a callback (napi `ThreadsafeFunction`)
-/// per channel.
+/// Tool definition the model can call this turn. Mirrors
+/// `model_api_proto::ToolDef`.
+#[napi(object)]
+#[derive(Clone)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: Vec<ToolParam>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct ToolParam {
+    pub name: String,
+    /// Loose type string: `"string"`, `"integer"`, `"boolean"`,
+    /// `"number"`, `"array"`, `"object"`.
+    #[napi(js_name = "type")]
+    pub param_type: String,
+    pub required: bool,
+    pub description: String,
+}
+
+/// A tool the model wants the client to execute. Returned in
+/// `InferenceResponse.toolCalls` when `toolMode` is `'client'`
+/// (or `'auto'` with tools present).
+#[napi(object)]
+pub struct ToolCall {
+    /// Echo as `ToolResult.callId` on the next request.
+    pub id: String,
+    pub name: String,
+    /// JSON-encoded argument object. `JSON.parse(...)` before
+    /// invoking the tool; the server doesn't validate against
+    /// the tool's parameter schema today.
+    pub arguments_json: String,
+}
+
+/// Result of executing a tool call. Send on the next
+/// `inference()` to feed the model's continuation.
+#[napi(object)]
+#[derive(Clone)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub output: String,
+}
+
+/// Inference request as seen from JS. Mirrors
+/// `model_api_proto::InferenceRequest` plus the expanded
+/// InferenceConfig sampler knobs. Streaming + progress are TODOs.
 #[napi(object)]
 #[derive(Clone)]
 pub struct InferenceRequest {
@@ -62,13 +129,40 @@ pub struct InferenceRequest {
     /// string = ask the server to create a fresh persistent
     /// session.
     pub session_id: Option<String>,
-    /// Conversation Merkle root. Pass 0 (or omit) when the caller
-    /// doesn't track one; the server's KV-cache logic uses it to
-    /// short-circuit delta-prefill.
+    /// Conversation Merkle root. Pass `0n` (BigInt) or omit when
+    /// the caller doesn't track one.
     pub cache_hash: Option<BigInt>,
-    /// Skip prefilling the `<think>\n` prefix at the start of the
-    /// assistant turn. Useful for chat-completion APIs that don't
-    /// want a chain-of-thought block in the response.
+
+    // ── Tool wire ──
+    /// Tool definitions the model can call this turn. Omit / empty
+    /// for plain chat. Model-agnostic shape — the server hands
+    /// these to the loaded model's format adapter (Gemma 4 Jinja,
+    /// ChatML, etc.).
+    pub tools: Option<Vec<ToolDef>>,
+    /// Results from tool calls the client executed in response to
+    /// a prior turn. The server formats each via the model's
+    /// `format_response` and folds them into the next user turn.
+    pub tool_results: Option<Vec<ToolResult>>,
+    /// `'auto'` (default — `'client'` when tools are present,
+    /// `'server'` otherwise), `'server'` (in-band dispatcher
+    /// runs server-side tools), or `'client'` (server returns
+    /// tool calls; JS executes externally).
+    pub tool_mode: Option<String>,
+
+    // ── Sampler / output shape ──
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub rep_penalty: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    /// Per-request cap; overrides `maxTokens` when smaller. None
+    /// = use `maxTokens` as the only ceiling.
+    pub max_tokens_override: Option<u32>,
+    pub system_prompt: Option<String>,
+    /// `'none'`, `'tool-only'`, `'thinking-with-tools'`,
+    /// `'any-json'`, `'notes-classifier-json'`. Default `'none'`.
+    pub json_mode: Option<String>,
+    /// Skip prefilling the `<think>\n` prefix. Useful for plain
+    /// chat-completion APIs.
     pub disable_think_prefix: Option<bool>,
 }
 
@@ -83,9 +177,14 @@ pub struct InferenceResponse {
     /// Raw model output, including `<think>...</think>` and any
     /// injected tool-response blocks. Use for transcript logging.
     pub raw_text: Option<String>,
-    /// Tool-response bodies the dispatcher spliced in during
-    /// generation, in order. Empty when no injections fired.
+    /// Tool-response bodies the *server-side* dispatcher spliced
+    /// in during generation, in order. Empty when no injections
+    /// fired or when `toolMode` was `'client'`.
     pub injections: Vec<String>,
+    /// Tool calls the model emitted that the client needs to
+    /// execute (when `toolMode` was `'client'` or `'auto'` with
+    /// tools present). Empty otherwise.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -180,6 +279,25 @@ fn to_proto_request(r: InferenceRequest) -> std::result::Result<proto::Inference
     let cache_hash = r.cache_hash
         .map(|bi| bi.get_u64().1)  // (sign_bit, value, lossless?)
         .unwrap_or(0);
+    let tool_mode = match r.tool_mode.as_deref() {
+        None | Some("auto") => proto::ToolMode::Auto,
+        Some("server") => proto::ToolMode::Server,
+        Some("client") => proto::ToolMode::Client,
+        Some(other) => return Err(format!(
+            "toolMode must be 'auto', 'server', or 'client'; got {other:?}"
+        )),
+    };
+    let json_mode = match r.json_mode.as_deref() {
+        None | Some("none") => proto::JsonMode::None,
+        Some("tool-only") => proto::JsonMode::ToolOnly,
+        Some("thinking-with-tools") => proto::JsonMode::ThinkingWithTools,
+        Some("any-json") => proto::JsonMode::AnyJSON,
+        Some("notes-classifier-json") => proto::JsonMode::NotesClassifierJSON,
+        Some(other) => return Err(format!(
+            "jsonMode must be one of 'none','tool-only','thinking-with-tools',\
+             'any-json','notes-classifier-json'; got {other:?}"
+        )),
+    };
     Ok(proto::InferenceRequest {
         role,
         input: proto::InferenceInput::Text(r.input),
@@ -190,7 +308,17 @@ fn to_proto_request(r: InferenceRequest) -> std::result::Result<proto::Inference
         },
         inference_config: proto::InferenceConfig {
             disable_think_prefix: r.disable_think_prefix.unwrap_or(false),
+            json_mode,
+            temperature: r.temperature.map(|x| x as f32),
+            top_p: r.top_p.map(|x| x as f32),
+            rep_penalty: r.rep_penalty.map(|x| x as f32),
+            presence_penalty: r.presence_penalty.map(|x| x as f32),
+            max_tokens: r.max_tokens_override,
+            system_prompt: r.system_prompt,
+            tool_mode,
         },
+        tools: r.tools.unwrap_or_default().into_iter().map(to_proto_tool_def).collect(),
+        tool_results: r.tool_results.unwrap_or_default().into_iter().map(to_proto_tool_result).collect(),
         cache_hash,
         // Streaming + progress not yet wired through to JS; non-
         // streaming path returns one final response.
@@ -199,11 +327,33 @@ fn to_proto_request(r: InferenceRequest) -> std::result::Result<proto::Inference
     })
 }
 
+fn to_proto_tool_def(t: ToolDef) -> proto::ToolDef {
+    proto::ToolDef {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters.into_iter().map(|p| proto::ToolParam {
+            name: p.name,
+            param_type: p.param_type,
+            required: p.required,
+            description: p.description,
+        }).collect(),
+    }
+}
+
+fn to_proto_tool_result(r: ToolResult) -> proto::ToolResult {
+    proto::ToolResult { call_id: r.call_id, output: r.output }
+}
+
 fn from_proto_response(r: proto::InferenceResponse) -> InferenceResponse {
     InferenceResponse {
         text: r.text,
         session_id: r.session_id,
         raw_text: r.raw_text,
         injections: r.injections,
+        tool_calls: r.tool_calls.into_iter().map(|c| ToolCall {
+            id: c.id,
+            name: c.name,
+            arguments_json: c.arguments_json,
+        }).collect(),
     }
 }

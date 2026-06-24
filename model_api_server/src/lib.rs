@@ -169,6 +169,7 @@ pub fn error_response(message: impl Into<String>) -> InferenceResponse {
         session_id: None,
         raw_text: None,
         injections: Vec::new(),
+        tool_calls: Vec::new(),
         replacement: None,
     }
 }

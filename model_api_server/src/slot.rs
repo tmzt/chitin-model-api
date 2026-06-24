@@ -75,11 +75,27 @@ impl SlotHandle for StubSlot {
             model_api_proto::SessionMode::Stateless => None,
             model_api_proto::SessionMode::Persistent { session_id } => Some(session_id),
         };
+        // Tool-aware echo: if the caller passed a tool def, emit a
+        // canned ToolCall for the first tool so tests can exercise
+        // the wire-side tool-call round-trip without a real model.
+        // The id is deterministic (just `tc-0`) — tests asserting on
+        // call ids stay stable across runs.
+        let tool_calls = if !req.req.tools.is_empty() {
+            let first = &req.req.tools[0];
+            vec![model_api_proto::ToolCall {
+                id: "tc-0".into(),
+                name: first.name.clone(),
+                arguments_json: "{}".into(),
+            }]
+        } else {
+            Vec::new()
+        };
         Ok(SlotResponse(InferenceResponse {
             text: format!("echo: {prompt}"),
             session_id,
             raw_text: Some(format!("<raw>echo: {prompt}</raw>")),
             injections: Vec::new(),
+            tool_calls,
             replacement: None,
         }))
     }

@@ -80,6 +80,21 @@ pub struct InferenceRequest {
     pub max_tokens: u32,
     pub session: SessionMode,
     pub inference_config: InferenceConfig,
+    /// Tool definitions the model can call this turn. The server
+    /// hands these to the loaded model's `ToolFormat` adapter so the
+    /// system prompt is rendered model-natively (Gemma 4 Jinja,
+    /// ChatML, XML, etc.) — clients pass abstract tool defs and let
+    /// the server pick the wire format. Empty = no tools available
+    /// this turn.
+    #[serde(default)]
+    pub tools: Vec<ToolDef>,
+    /// Results from tool calls the client executed in response to a
+    /// prior turn's `tool_calls`. The server formats each via the
+    /// loaded model's `ToolFormat::format_response` and folds them
+    /// into the next user turn before generation. Empty = no
+    /// pending tool results.
+    #[serde(default)]
+    pub tool_results: Vec<ToolResult>,
     /// Merkle root of the conversation the caller has committed. Used
     /// by the server to decide whether to re-prefill or reuse the
     /// on-disk KV cache. 0 = "caller didn't supply one".
@@ -104,13 +119,163 @@ pub enum InferenceInput {
     Mel { data: Vec<f32>, frames: u32 },
 }
 
-/// Per-request knob bag — future structured-output flags land here so
-/// the outer `InferenceRequest` schema stays stable.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Per-request knob bag. Mirrors `common::handles::InferenceConfig`'s
+/// sampler + structure fields; new flags land here so the outer
+/// `InferenceRequest` schema stays stable. All defaults match the
+/// in-process side so an empty `InferenceConfig` reproduces the
+/// server's baked-in behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceConfig {
     /// Skip prefilling `<think>\n` at the start of the assistant turn.
+    /// Useful for plain chat-completion APIs that don't want a
+    /// chain-of-thought block in the response.
+    #[serde(default)]
     pub disable_think_prefix: bool,
-    // Future: schema-pinned output, sampler overrides, etc.
+    /// Output-shape constraint. `None` = free-form text.
+    #[serde(default)]
+    pub json_mode: JsonMode,
+    /// Softmax temperature. Lower = more deterministic. `None` =
+    /// server default (~0.7).
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Nucleus cumulative probability. `None` = server default (~0.8).
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Repetition penalty. `None` = 1.0 (off).
+    #[serde(default)]
+    pub rep_penalty: Option<f32>,
+    /// Presence penalty. `None` = server default (~1.5).
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// Per-request token cap override. `None` =
+    /// `InferenceRequest::max_tokens` is the only cap.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// System-prompt override for this turn. `None` = use the
+    /// session/role baked-in system prompt.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// How the server should handle tool calls the model emits
+    /// during generation. See [`ToolMode`].
+    #[serde(default)]
+    pub tool_mode: ToolMode,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            disable_think_prefix: false,
+            json_mode: JsonMode::default(),
+            temperature: None,
+            top_p: None,
+            rep_penalty: None,
+            presence_penalty: None,
+            max_tokens: None,
+            system_prompt: None,
+            tool_mode: ToolMode::default(),
+        }
+    }
+}
+
+/// Output-shape constraint. Mirrors `common::handles::JsonMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum JsonMode {
+    /// No constraint. Free-form text.
+    #[default]
+    None,
+    /// Force a single `<tool_call>{...}</tool_call>` reply, nothing
+    /// else. No `<think>` prefix.
+    ToolOnly,
+    /// Like `ToolOnly` but prefills `<think>\n` first so the model
+    /// reasons before dispatching.
+    ThinkingWithTools,
+    /// Force a single JSON object, no surrounding markers or prose.
+    /// No key-name constraint.
+    AnyJSON,
+    /// Notes-classifier-specific schema: `{"project":..., "topics":...,
+    /// "summary":...}`.
+    NotesClassifierJSON,
+}
+
+/// Where tool calls get dispatched. See [`InferenceConfig::tool_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ToolMode {
+    /// Auto-pick: `Client` when [`InferenceRequest::tools`] is
+    /// non-empty, `Server` otherwise. Default.
+    #[default]
+    Auto,
+    /// Server dispatches tool calls mid-generation via its built-in
+    /// catalog (memory, project graph, etc.). The client never sees
+    /// the calls; the model's continuation reflects the tool
+    /// results. Matches today's `EpiphanyDispatcher` behaviour.
+    Server,
+    /// Server buffers tool calls and returns them in
+    /// [`InferenceResponse::tool_calls`]. Generation stops at the
+    /// first call. Client executes the tool externally and replies
+    /// with [`InferenceRequest::tool_results`] on the next turn.
+    /// Matches OpenAI's function-calling loop — what agent clients
+    /// (pi-ai, etc.) expect.
+    Client,
+}
+
+// ── Tool wire types ─────────────────────────────────────────────────
+
+/// Tool definition the model can call. Mirrors
+/// `common::types::ExternalToolDef` field-for-field so the server
+/// can hand it straight to `ToolFormat::system_prompt_fragment`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDef {
+    /// Stable identifier the model emits when it wants to call this
+    /// tool.
+    pub name: String,
+    /// Free-form description rendered into the system prompt's tool
+    /// catalog. Keep short; the model reads it every turn.
+    pub description: String,
+    /// Ordered parameter list. Order matters — some formats render
+    /// the parameters positionally.
+    pub parameters: Vec<ToolParam>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolParam {
+    pub name: String,
+    /// Loose type string: `"string"`, `"integer"`, `"boolean"`,
+    /// `"number"`, `"array"`, `"object"`. Matches what the
+    /// per-model `ToolFormat` rendering paths consume.
+    #[serde(rename = "type")]
+    pub param_type: String,
+    pub required: bool,
+    pub description: String,
+}
+
+/// A tool the model wants the client to execute. Returned in
+/// [`InferenceResponse::tool_calls`] when
+/// [`ToolMode::Client`] is in effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Server-assigned identifier. Echo back as
+    /// [`ToolResult::call_id`] on the next request so the server can
+    /// pair results to calls.
+    pub id: String,
+    pub name: String,
+    /// JSON-encoded argument object. Parse with `JSON.parse(...)`
+    /// in JS or `serde_json::from_str` in Rust before invoking the
+    /// tool.
+    pub arguments_json: String,
+}
+
+/// Result of executing a tool call. Carried in
+/// [`InferenceRequest::tool_results`] on the next turn after the
+/// model emitted [`ToolCall`]s.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    /// Matches [`ToolCall::id`] on the corresponding call.
+    pub call_id: String,
+    /// String the server wraps via
+    /// `ToolFormat::format_response(output)` and folds back into
+    /// the model's context. Free-form — the tool decides whether
+    /// to return raw text, JSON, an error message, etc.
+    pub output: String,
 }
 
 /// How the server should treat the session's KV cache.
@@ -170,9 +335,16 @@ pub struct InferenceResponse {
     /// Raw decoded model output, including `<think>...</think>` and
     /// any injected `<tool_response>...</tool_response>` blocks.
     pub raw_text: Option<String>,
-    /// Tool-response payloads that the dispatcher injected during this
-    /// generation, in order.
+    /// Tool-response payloads that the *server-side* dispatcher
+    /// injected during this generation, in order. Always empty when
+    /// [`ToolMode::Client`] is in effect — those calls land in
+    /// `tool_calls` instead.
     pub injections: Vec<String>,
+    /// Tool calls the model emitted that the client needs to
+    /// execute. Populated when [`ToolMode::Client`] is in effect
+    /// (or `Auto` with tools present). Empty otherwise.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
     /// Set when the inference loop terminated because the dispatcher
     /// signalled a session hand-off.
     pub replacement: Option<SessionReplacement>,
@@ -190,4 +362,13 @@ pub struct SessionReplacement {
 
 /// Bump when adding/removing variants or fields. Client + server
 /// negotiate via [`ClientMessage::Hello`] / [`ServerMessage::Hello`].
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version history:
+///   1 — initial. Hello/Inference/Cancel/Shutdown envelopes;
+///       single `disable_think_prefix` knob in InferenceConfig.
+///   2 — adds tool definitions on requests (`tools`,
+///       `tool_results`), tool calls on responses (`tool_calls`),
+///       expanded InferenceConfig (temperature/top_p/rep_penalty/
+///       presence_penalty/max_tokens/json_mode/system_prompt/
+///       tool_mode), and JsonMode + ToolMode enums.
+pub const PROTOCOL_VERSION: u32 = 2;

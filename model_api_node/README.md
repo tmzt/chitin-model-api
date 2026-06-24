@@ -71,6 +71,23 @@ on the underlying mutex. Resolves with the final response;
 rejects on `InferenceError` from the server or transport failure.
 
 ```ts
+type ToolMode = 'auto' | 'server' | 'client'
+type JsonMode = 'none' | 'tool-only' | 'thinking-with-tools'
+              | 'any-json' | 'notes-classifier-json'
+
+interface ToolDef {
+  name: string
+  description: string
+  parameters: Array<{
+    name: string
+    type: string        // "string" | "integer" | "boolean" | "number" | "array" | "object"
+    required: boolean
+    description: string
+  }>
+}
+interface ToolCall { id: string; name: string; argumentsJson: string }
+interface ToolResult { callId: string; output: string }
+
 interface InferenceRequest {
   /** Routing role on the server side. */
   role: 'fast' | 'deep' | 'asr' | 'omni'
@@ -90,12 +107,55 @@ interface InferenceRequest {
   sessionId?: string
 
   /**
-   * Caller-supplied Merkle root of the conversation they think the
-   * server's KV cache already represents. Server falls through to a
-   * full rebuild on mismatch. Default 0 = "I don't track one".
+   * Caller-supplied Merkle root of the conversation. 0n / omit = "I
+   * don't track one".
    */
   cacheHash?: bigint
 
+  // ── Tool wire ──
+  /**
+   * Tools the model can call this turn. Model-agnostic shape; the
+   * server hands these to the loaded model's format adapter so
+   * Gemma 4 / ChatML / etc. get a model-native system prompt.
+   * Empty / omit for plain chat.
+   */
+  tools?: ToolDef[]
+
+  /**
+   * Results from tool calls the client executed in response to a
+   * prior turn. The server formats each via the model's
+   * `ToolFormat::format_response` and folds them into the next user
+   * turn before generation.
+   */
+  toolResults?: ToolResult[]
+
+  /**
+   * Where tool calls are dispatched.
+   *  - 'auto'   — 'client' when tools are present, 'server' otherwise.
+   *               Default.
+   *  - 'server' — in-band dispatcher runs server-known tools
+   *               (memory, project graph, etc.) mid-generation. The
+   *               client never sees the calls; the response shows
+   *               them in `injections`.
+   *  - 'client' — server buffers tool calls and returns them in
+   *               `toolCalls`. Client runs the tool externally and
+   *               replies with `toolResults` next turn. Matches the
+   *               OpenAI function-calling loop — what agent clients
+   *               (pi-ai, etc.) expect.
+   */
+  toolMode?: ToolMode
+
+  // ── Sampler / output shape ──
+  temperature?: number
+  topP?: number
+  repPenalty?: number
+  presencePenalty?: number
+  /** Per-request cap; overrides `maxTokens` when smaller. */
+  maxTokensOverride?: number
+  /** Override the session/role system prompt for this turn. */
+  systemPrompt?: string
+  /** Default 'none' (free-form). */
+  jsonMode?: JsonMode
   /**
    * Skip prefilling the model's `<think>\n` chain-of-thought prefix.
    * Useful for plain chat-completion APIs that don't want a think
@@ -119,11 +179,61 @@ interface InferenceResponse {
   rawText?: string
 
   /**
-   * Tool-response payloads the dispatcher spliced in during
-   * generation, in order. Empty when no injections fired.
+   * Server-side tool dispatches that fired during generation, in
+   * order. Empty when no injections fired or when `toolMode` was
+   * `'client'`.
    */
   injections: string[]
+
+  /**
+   * Tool calls the model emitted that the client needs to execute.
+   * Populated when `toolMode` was `'client'` (or `'auto'` with
+   * tools present). Empty otherwise.
+   */
+  toolCalls: ToolCall[]
 }
+```
+
+## Agent loop example
+
+```js
+const { Client } = require('@chitin/model-api');
+
+const calc = (expr) => String(eval(expr));   // toy tool
+
+const c = await Client.connect('/tmp/chitin-model-api.sock');
+const sessionId = `agent-${Date.now()}`;
+let toolResults = [];
+let input = 'What is (2+2)*7?';
+
+for (let turn = 0; turn < 5; turn++) {
+  const r = await c.inference({
+    role: 'deep',
+    input,
+    maxTokens: 256,
+    sessionId,
+    tools: [{
+      name: 'calculator',
+      description: 'Evaluate a math expression',
+      parameters: [{ name: 'expr', type: 'string', required: true, description: '' }],
+    }],
+    toolResults,
+  });
+
+  if (r.toolCalls.length === 0) {
+    console.log('Final answer:', r.text);
+    break;
+  }
+
+  // Model wants tools called — run them, queue results for next turn.
+  toolResults = r.toolCalls.map((tc) => {
+    const args = JSON.parse(tc.argumentsJson);
+    return { callId: tc.id, output: calc(args.expr) };
+  });
+  input = '';   // model has the prior turn via the session
+}
+
+await c.shutdown();
 ```
 
 ### `client.shutdown(): Promise<void>`
