@@ -17,6 +17,7 @@ use model_api_proto::{
 
 pub mod framed;
 pub mod slot;
+pub mod subprocess_slot;
 
 // Real backend — gated on `llama-cpp` because it pulls
 // thinker_impl + llama-cpp-2 + llama_engine. Without the feature,
