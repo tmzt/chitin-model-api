@@ -35,6 +35,15 @@ pub mod llama_slot;
 #[cfg(feature = "llama-cpp")]
 pub mod turn_render;
 
+// Text-marker tool-call utilities (parse `<|tool_call>…<tool_call|>`
+// out of model output, splice tool results into a turn list). Used
+// by LlamaSlot for its raw-text path. Belt-and-suspenders only —
+// backends with native structured tool calls (LiteRT-LM
+// Conversation) MUST NOT call these. Gated on `llama-cpp` because
+// it depends on `common::tool_format`, same as turn_render.
+#[cfg(feature = "llama-cpp")]
+pub mod tool_text;
+
 // LiteRT-LM backend — Pixel demo path (PowerVR OpenCL via Google's
 // litertlm crate). Gated on its own feature so the workspace can
 // build without dragging in litertlm + its native libLiteRtLmC.so.
