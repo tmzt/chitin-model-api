@@ -155,8 +155,9 @@ pub struct Turn {
     pub content: String,
     /// Set when `role == Tool` so the slot can correlate the result
     /// back to the assistant turn that issued the matching call.
-    /// Otherwise `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Otherwise `None`. (No `skip_serializing_if` — bincode is
+    /// positional, every field must be present on every wire frame
+    /// or the next field reads into the wrong bytes.)
     pub tool_call_id: Option<String>,
 }
 
