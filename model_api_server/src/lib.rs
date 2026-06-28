@@ -26,6 +26,15 @@ pub mod subprocess_slot;
 #[cfg(feature = "llama-cpp")]
 pub mod llama_slot;
 
+// Turn-list -> chat-template string renderer for the LlamaSlot
+// path. Gated on `llama-cpp` because it depends on
+// `common::chat_format`, which is only pulled into the dep tree
+// alongside thinker_impl. LiteRtLmSlot doesn't need it — the
+// model's chat_template.jinja is applied internally by the C
+// Conversation API.
+#[cfg(feature = "llama-cpp")]
+pub mod turn_render;
+
 // LiteRT-LM backend — Pixel demo path (PowerVR OpenCL via Google's
 // litertlm crate). Gated on its own feature so the workspace can
 // build without dragging in litertlm + its native libLiteRtLmC.so.
