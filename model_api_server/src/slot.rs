@@ -159,6 +159,17 @@ fn synth_echo_response(req: &SlotRequest) -> InferenceResponse {
     // a Text input gets a marker so test failures are obvious.
     let prompt = match &req.req.input {
         model_api_proto::InferenceInput::Text(t) => t.clone(),
+        model_api_proto::InferenceInput::Turns(turns) => {
+            // Echo the last user turn so streaming tests still see a
+            // recognisable response. Stub is for protocol smokes, not
+            // chat-template fidelity.
+            turns
+                .iter()
+                .rev()
+                .find(|t| matches!(t.role, model_api_proto::Role::User))
+                .map(|t| t.content.clone())
+                .unwrap_or_else(|| "[stub: empty turns]".into())
+        }
         model_api_proto::InferenceInput::Pcm { .. } => "[stub: pcm]".into(),
         model_api_proto::InferenceInput::Mel { .. } => "[stub: mel]".into(),
     };

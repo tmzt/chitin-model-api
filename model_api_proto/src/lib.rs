@@ -115,14 +115,68 @@ pub struct InferenceRequest {
     pub progress: bool,
 }
 
-/// Wire-shape of the input payload. Today only `Text` is meaningful
-/// on the llama.cpp path; the audio variants are stubs reserved for
-/// future routing.
+/// Wire-shape of the input payload.
+///
+/// - `Text(s)` is a single, untemplated user message — the slot may
+///   prepend its own chat template (LlamaSlot path) or wrap it as a
+///   single User turn (LiteRtLmSlot path). Callers MUST NOT
+///   pre-render a chat template into `Text`; use `Turns` for
+///   structured multi-turn input.
+/// - `Turns(t)` is a model-agnostic turn list. The receiving slot
+///   either renders it through the model's `ChatFormat` (LlamaSlot)
+///   or feeds turns sequentially into LiteRT-LM's `Conversation`
+///   (LiteRtLmSlot).
+/// - `Pcm` / `Mel` are stubs reserved for future audio routing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InferenceInput {
     Text(String),
+    Turns(Vec<Turn>),
     Pcm { samples: Vec<f32>, sample_rate: u32 },
     Mel { data: Vec<f32>, frames: u32 },
+}
+
+/// Role of a single conversation turn. Mirrors the OpenAI-style
+/// chat-completion roles. `Tool` carries a tool result with the
+/// matching `tool_call_id` set on the [`Turn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// One conversation turn. The slot's `ChatFormat` is responsible for
+/// rendering the role + content into the model's template; clients
+/// don't need to know what tokens the model uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Turn {
+    pub role: Role,
+    pub content: String,
+    /// Set when `role == Tool` so the slot can correlate the result
+    /// back to the assistant turn that issued the matching call.
+    /// Otherwise `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl Turn {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: Role::User, content: content.into(), tool_call_id: None }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: Role::Assistant, content: content.into(), tool_call_id: None }
+    }
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: Role::System, content: content.into(), tool_call_id: None }
+    }
+    pub fn tool(content: impl Into<String>, call_id: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+        }
+    }
 }
 
 /// Per-request knob bag. Mirrors `common::handles::InferenceConfig`'s
@@ -402,4 +456,10 @@ pub struct SessionReplacement {
 ///       expanded InferenceConfig (temperature/top_p/rep_penalty/
 ///       presence_penalty/max_tokens/json_mode/system_prompt/
 ///       tool_mode), and JsonMode + ToolMode enums.
-pub const PROTOCOL_VERSION: u32 = 2;
+///   3 — adds `InferenceInput::Turns(Vec<Turn>)` and the `Role` /
+///       `Turn` types so clients can ship model-agnostic turn lists
+///       instead of pre-rendered chat templates. `Text` is
+///       redefined as "single untemplated user message" (clients
+///       MUST NOT pre-template). Slots are now the only layer that
+///       knows the model's chat-template tokens.
+pub const PROTOCOL_VERSION: u32 = 3;

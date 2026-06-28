@@ -86,6 +86,15 @@ impl LiteRtLmSlot {
     fn extract_prompt(input: &InferenceInput) -> Result<String, String> {
         match input {
             InferenceInput::Text(t) => Ok(t.clone()),
+            // Turns dispatch lands in P5 (session-keyed Conversation
+            // pool). For now grab the last user turn so the wire
+            // compat path keeps something working until then.
+            InferenceInput::Turns(turns) => turns
+                .iter()
+                .rev()
+                .find(|t| matches!(t.role, model_api_proto::Role::User))
+                .map(|t| t.content.clone())
+                .ok_or_else(|| "Turns: no user turn found".into()),
             InferenceInput::Pcm { .. } | InferenceInput::Mel { .. } => {
                 Err("audio inputs not supported on litert-lm backend".into())
             }

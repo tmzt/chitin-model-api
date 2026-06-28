@@ -323,6 +323,15 @@ fn build_prompt_with_tool_results(
 ) -> Result<String, String> {
     let user_text = match input {
         InferenceInput::Text(t) => t.clone(),
+        // Turns handling lands in P4; for now P1's wire-compat fix
+        // routes through here with a fallback that joins all
+        // user-role turns. Replaced in P4 by ChatFormat::render_turns.
+        InferenceInput::Turns(turns) => turns
+            .iter()
+            .filter(|t| matches!(t.role, model_api_proto::Role::User))
+            .map(|t| t.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
         InferenceInput::Pcm { .. } | InferenceInput::Mel { .. } => {
             return Err("audio inputs not supported on the llama backend".into());
         }
@@ -398,6 +407,12 @@ fn to_common_role(r: GpuRole) -> CommonRole {
 fn to_common_input(i: InferenceInput) -> CommonInput {
     match i {
         InferenceInput::Text(t) => CommonInput::Text(t),
+        // Turns -> text fallback for the dead-code helper. Real Turns
+        // handling for the LlamaSlot path lives in P4 (chat-format
+        // render); this branch exists only to satisfy exhaustiveness.
+        InferenceInput::Turns(turns) => CommonInput::Text(
+            turns.into_iter().map(|t| t.content).collect::<Vec<_>>().join("\n"),
+        ),
         InferenceInput::Pcm { samples, sample_rate } => CommonInput::Pcm { samples, sample_rate },
         InferenceInput::Mel { data, frames } => CommonInput::Mel { data, frames },
     }
