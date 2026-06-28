@@ -34,15 +34,17 @@ use common::handles::{
     InferenceInput as CommonInput, JsonMode as CommonJsonMode, KvCacheMode,
     SessionMode as CommonSession, ThinkerRequest, ThinkerResource,
 };
+use common::chat_format::{ChatFormat, Gemma4Format};
 use common::tool_format::{Gemma4ToolFormat, ToolFormat};
 use common::types::{ExternalToolDef, ExternalToolParam};
 use model_api_proto::{
-    GpuRole, InferenceInput, InferenceRequest, InferenceResponse, JsonMode, SessionMode,
-    SessionReplacement, ToolCall, ToolDef, ToolMode, ToolResult,
+    GpuRole, InferenceInput, InferenceResponse, JsonMode, SessionMode,
+    SessionReplacement, ToolDef, ToolMode,
 };
 use thinker_impl::ThinkerConfig;
 
 use crate::slot::{SlotHandle, SlotRequest, SlotResponse, StreamSink};
+use crate::{tool_text, turn_render};
 
 /// SlotHandle backed by `thinker_impl::spawn_resource`.
 ///
@@ -54,9 +56,18 @@ use crate::slot::{SlotHandle, SlotRequest, SlotResponse, StreamSink};
 pub struct LlamaSlot {
     resource: Box<dyn ThinkerResource>,
     /// Active tool format for the loaded model. Used by
-    /// [`extract_tool_calls`] to parse markers out of `raw_text`
-    /// when the wire request asked for client-side tool dispatch.
+    /// [`tool_text::extract_tool_calls`] to parse markers out of
+    /// `raw_text` when the wire request asked for client-side tool
+    /// dispatch, and by [`tool_text::tool_results_to_turns`] to
+    /// wrap incoming tool results before they're spliced into the
+    /// turn list.
     tool_format: Arc<dyn ToolFormat>,
+    /// Active chat format — the per-role marker template
+    /// (e.g. Gemma 4's `<|turn>{role}\n…<turn|>`). Used by
+    /// [`turn_render::render_turns`] to convert
+    /// `InferenceInput::Turns` into the raw-prompt string
+    /// thinker_impl expects.
+    chat_format: Arc<dyn ChatFormat>,
 }
 
 impl LlamaSlot {
@@ -72,12 +83,13 @@ impl LlamaSlot {
         max_seq_len: u32,
     ) -> Result<Self, String> {
         // Gemma 4 is the current production target; the per-model
-        // ToolFormat is the abstraction point for other models. To
-        // support a different model, add a CLI flag that picks the
-        // right ToolFormat impl here (and adjust the channels
+        // ToolFormat + ChatFormat are the abstraction points for
+        // other models. To support a different model, add a CLI flag
+        // that picks the right pair here (and adjust the channels
         // driver's marker detection — same Arc<dyn ToolFormat>
         // value).
         let tool_format: Arc<dyn ToolFormat> = Arc::new(Gemma4ToolFormat);
+        let chat_format: Arc<dyn ChatFormat> = Arc::new(Gemma4Format);
 
         let config = ThinkerConfig {
             model_dir,
@@ -105,7 +117,7 @@ impl LlamaSlot {
             tool_sets: Arc::new(Vec::new()),
         };
         let resource = thinker_impl::spawn_resource(config);
-        Ok(Self { resource, tool_format })
+        Ok(Self { resource, tool_format, chat_format })
     }
 }
 
@@ -157,14 +169,32 @@ impl LlamaSlot {
             Some(req.tools.iter().map(to_common_tool_def).collect::<Vec<_>>())
         };
 
-        // Fold any prior turn's tool results into the user input.
-        // Each ToolResult is formatted via the active model's
-        // ToolFormat (Gemma 4: `<tool_response>...</tool_response>`)
-        // and prepended to the new user message so the model sees
-        // its prior `<tool_call>` echoed back with the result.
-        let prompt = build_prompt_with_tool_results(
-            &req.input, &req.tool_results, &*self.tool_format,
-        )?;
+        // Two prompt assembly paths depending on the wire input:
+        // - Turns: use the model's ChatFormat to render the full
+        //   turn list (tool results spliced in as Role::Tool turns
+        //   first). thinker_impl's `<|turn>`-detection at
+        //   llama_slot.rs:380 sees pre-wrapped markers and skips
+        //   its own templating — no double-wrap.
+        // - Text: legacy path. Just prepend formatted tool results
+        //   to the raw user text; thinker_impl wraps the whole
+        //   thing in one user turn.
+        let prompt = match &req.input {
+            InferenceInput::Turns(turns) => {
+                let mut all = turns.clone();
+                all.extend(tool_text::tool_results_to_turns(
+                    &req.tool_results, &*self.tool_format));
+                turn_render::render_turns(
+                    &*self.chat_format,
+                    &all,
+                    req.inference_config.system_prompt.as_deref(),
+                )
+            }
+            InferenceInput::Text(s) => tool_text::prepend_tool_results_to_text(
+                s, &req.tool_results, &*self.tool_format),
+            InferenceInput::Pcm { .. } | InferenceInput::Mel { .. } => {
+                return Err("audio inputs not supported on the llama backend".into());
+            }
+        };
 
         // Inference config — wire values override the defaults
         // when present. None on the wire = "use server default"
@@ -263,7 +293,7 @@ impl LlamaSlot {
         // marker-stripping state machine), so we scan with the
         // active model's ToolFormat.
         let tool_calls = if want_client_dispatch {
-            extract_tool_calls(&common_resp.text, &*self.tool_format)
+            tool_text::extract_tool_calls(&common_resp.text, &*self.tool_format)
         } else {
             Vec::new()
         };
@@ -304,94 +334,10 @@ fn drain_progress(rx: &async_channel::Receiver<common::handles::ProgressEvent>, 
     }
 }
 
-// ── Tool result folding + tool call extraction ──────────────────────
-
-/// Build the user input for the next turn. When prior tool results
-/// are present, each is wrapped via the active model's
-/// `ToolFormat::format_response` and prepended in order; the
-/// original `input` text becomes the trailing user message.
-///
-/// `tool_results` is empty on the very first turn of a tool-using
-/// session, in which case this is a no-op pass-through. `call_id`
-/// is informational only today (Gemma 4's format ignores it);
-/// retained on the wire so future formats that need correlation
-/// can use it.
-fn build_prompt_with_tool_results(
-    input: &InferenceInput,
-    tool_results: &[ToolResult],
-    tool_format: &dyn ToolFormat,
-) -> Result<String, String> {
-    let user_text = match input {
-        InferenceInput::Text(t) => t.clone(),
-        // Turns handling lands in P4; for now P1's wire-compat fix
-        // routes through here with a fallback that joins all
-        // user-role turns. Replaced in P4 by ChatFormat::render_turns.
-        InferenceInput::Turns(turns) => turns
-            .iter()
-            .filter(|t| matches!(t.role, model_api_proto::Role::User))
-            .map(|t| t.content.clone())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        InferenceInput::Pcm { .. } | InferenceInput::Mel { .. } => {
-            return Err("audio inputs not supported on the llama backend".into());
-        }
-    };
-    if tool_results.is_empty() {
-        return Ok(user_text);
-    }
-    let mut out = String::new();
-    for r in tool_results {
-        out.push_str(&tool_format.format_response(&r.output));
-        out.push('\n');
-    }
-    out.push_str(&user_text);
-    Ok(out)
-}
-
-/// Scan `text` for tool-call marker pairs and convert each body
-/// into a wire [`ToolCall`]. Uses `tool_format.open_marker()` /
-/// `close_marker()` to locate pairs and `parse_body` to extract
-/// `(name, args)`. Tool ids are positional (`tc-0`, `tc-1`, …) —
-/// the underlying ToolFormat doesn't surface ids; clients should
-/// echo whatever id they received in the matching `ToolResult`.
-pub(crate) fn extract_tool_calls(text: &str, tool_format: &dyn ToolFormat) -> Vec<ToolCall> {
-    let open = tool_format.open_marker();
-    let close = tool_format.close_marker();
-    if open.is_empty() || close.is_empty() {
-        return Vec::new();
-    }
-    let mut calls = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(start) = text[cursor..].find(open) {
-        let body_start = cursor + start + open.len();
-        let Some(end) = text[body_start..].find(close) else { break };
-        let body = &text[body_start..body_start + end];
-        cursor = body_start + end + close.len();
-        if let Some(parsed) = tool_format.parse_body(body) {
-            // `Gemma4ToolFormat::parse_body` (and other in-process
-            // formats) inject a redundant `tool: <name>` key into args
-            // as a sentinel for the in-process EpiphanyDispatcher. For
-            // wire callers that's noise — remote tool runtimes
-            // (pi-ai's TypeBox validators, OpenAI-style function
-            // callers, etc.) typically reject unknown args fields and
-            // refuse to dispatch. Strip it at the boundary so the
-            // wire payload only contains what the caller's schema
-            // expects.
-            let mut args = parsed.args;
-            if let Some(obj) = args.as_object_mut() {
-                obj.remove("tool");
-            }
-            let args_json = serde_json::to_string(&args)
-                .unwrap_or_else(|_| "{}".to_string());
-            calls.push(ToolCall {
-                id: format!("tc-{}", calls.len()),
-                name: parsed.name,
-                arguments_json: args_json,
-            });
-        }
-    }
-    calls
-}
+// Tool result folding + tool call extraction relocated to
+// `crate::tool_text` so the helpers can be unit-tested without
+// pulling in the whole LlamaSlot dep tree, and so a future
+// non-llama-cpp slot can reuse them.
 
 // ── Translation helpers ─────────────────────────────────────────────
 
@@ -457,45 +403,5 @@ fn to_common_tool_def(t: &ToolDef) -> ExternalToolDef {
     }
 }
 
-// ── Unit tests for the parser ───────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use common::tool_format::Gemma4ToolFormat;
-
-    #[test]
-    fn extract_zero_calls_from_plain_text() {
-        let f = Gemma4ToolFormat;
-        let calls = extract_tool_calls("the answer is 4.", &f);
-        assert_eq!(calls.len(), 0);
-    }
-
-    #[test]
-    fn extract_one_call_gemma4_shape() {
-        let f = Gemma4ToolFormat;
-        // Gemma 4 emits `<|tool_call>call:NAME{ARGS}<tool_call|>`.
-        let text = "reasoning… <|tool_call>call:calculator{\"expr\":\"2+2\"}<tool_call|> done";
-        let calls = extract_tool_calls(text, &f);
-        assert_eq!(calls.len(), 1, "expected 1 call, got {calls:?}");
-        assert_eq!(calls[0].name, "calculator");
-        assert_eq!(calls[0].id, "tc-0");
-        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments_json).unwrap();
-        assert_eq!(args.get("expr").and_then(|v| v.as_str()), Some("2+2"));
-    }
-
-    #[test]
-    fn extract_multiple_calls_keep_order_and_unique_ids() {
-        let f = Gemma4ToolFormat;
-        let text = "\
-            <|tool_call>call:a{\"k\":1}<tool_call|>\n\
-            interlude\n\
-            <|tool_call>call:b{\"k\":2}<tool_call|>";
-        let calls = extract_tool_calls(text, &f);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "a");
-        assert_eq!(calls[0].id, "tc-0");
-        assert_eq!(calls[1].name, "b");
-        assert_eq!(calls[1].id, "tc-1");
-    }
-}
+// Parser unit tests moved to crate::tool_text::tests alongside the
+// extract_tool_calls implementation.
