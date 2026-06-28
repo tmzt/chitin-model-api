@@ -28,6 +28,18 @@ default = []
 # thinker_impl's same-named feature.
 llama-cpp = ["dep:thinker_impl", "dep:common"]
 
+# LiteRT-LM backend for the Pixel demo (PowerVR OpenCL).
+# Build the C shared library out of band:
+#   cd deps/litert-lm
+#   bazelisk build --config=android_arm64 //c:libLiteRtLmC.so
+# Then point cargo at it:
+#   LITERT_LM_LIB_DIR=$(realpath deps/litert-lm/bazel-bin/c) \
+#   cargo build -p model_api_server --features litert-lm \
+#         --target aarch64-linux-android
+# litert-sys (the TFLite runtime, pulled transitively) auto-downloads
+# its libLiteRt.so from Google Maven AAR for android_arm64.
+litert-lm = ["dep:litertlm", "dep:litert-lm-sys"]
+
 [lib]
 path = "src/lib.rs"
 
@@ -46,3 +58,17 @@ env_logger = "0.11"
 # Backend wiring — present only with the `llama-cpp` feature.
 thinker_impl = { path = "../thinker_impl", features = ["llama-cpp"], optional = true }
 common = { path = "../common", optional = true }
+
+# Backend wiring — present only with the `litert-lm` feature.
+# Path-dep on our local fork (deps/litert-rs) so we can:
+#   1. Vendor litert-lm v0.13.1 headers (the published 0.2.1 crate
+#      hardcodes v0.10.2 which can't load current Gemma-4 .litertlm
+#      files).
+#   2. Use the 6-arg `litert_lm_conversation_send_message_stream`
+#      signature with `LiteRtLmConversationOptionalArgs*` for
+#      `visual_token_budget` (required for multimodal Gemma-4 even
+#      on pure-text sends).
+# Toggle the `litert-lm-sys/generate-bindings` feature so bindgen
+# regenerates the FFI at build time against the v0.13.1 header.
+litertlm = { path = "../deps/litert-rs/litert-lm", optional = true }
+litert-lm-sys = { path = "../deps/litert-rs/litert-lm-sys", features = ["generate-bindings"], optional = true }

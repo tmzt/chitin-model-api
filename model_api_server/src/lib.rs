@@ -26,6 +26,12 @@ pub mod subprocess_slot;
 #[cfg(feature = "llama-cpp")]
 pub mod llama_slot;
 
+// LiteRT-LM backend — Pixel demo path (PowerVR OpenCL via Google's
+// litertlm crate). Gated on its own feature so the workspace can
+// build without dragging in litertlm + its native libLiteRtLmC.so.
+#[cfg(feature = "litert-lm")]
+pub mod litertlm_slot;
+
 pub use slot::{DiscardSink, SlotHandle, SlotRequest, SlotResponse, StreamSink};
 
 // Internal — events the streaming handler shuttles from the slot
