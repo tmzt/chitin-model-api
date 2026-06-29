@@ -107,7 +107,44 @@ struct Args {
     /// Deprecated alias: `--litertlm-session-ttl-secs`.
     #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
     litertlm_prefix_cache_ttl_secs: u64,
+    /// Slot-wide default system prompt for the LiteRT-LM backend.
+    /// Applied via `Engine::create_conversation_with_system` on every
+    /// cache miss; per-request `inference_config.system_prompt`
+    /// overrides it. `--litertlm-system-prompt @PATH` loads the prompt
+    /// from a file; plain `--litertlm-system-prompt "text"` is the
+    /// literal value. Default is the baked-in RLM-fallback prompt that
+    /// encourages the model to emit `SUBAGENT_PROMPT: <query>` for
+    /// questions it can't answer.
+    /// `--litertlm-no-system-prompt` disables the default entirely.
+    #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
+    litertlm_system_prompt: Option<String>,
 }
+
+/// Baked-in default system prompt for the LiteRT-LM backend.
+/// Instructs the model to be terse and to escalate uncertain answers
+/// via a `SUBAGENT_PROMPT:` marker line that the slot logs (and a
+/// follow-up will route to an actual subagent). Keep tight — every
+/// token here is prefilled into KV on every fresh Conversation.
+const DEFAULT_LITERTLM_SYSTEM_PROMPT: &str = "\
+You are a helpful conversational assistant running locally on a phone. \
+Be concise — usually 1-3 sentences.\n\
+\n\
+You have access to one tool, `subagent_prompt`, that dispatches a question \
+to a more capable expert subagent for research. Use it whenever you'd \
+otherwise have to say \"I don't know\" or \"I'm not sure\" — questions \
+about current events, recent news, time-sensitive facts, specialized \
+domain knowledge you can't verify, or computations beyond what you can do \
+reliably in your head.\n\
+\n\
+To call the tool, end your response with a single line in this exact format:\n\
+\n\
+SUBAGENT_PROMPT: <a complete, self-contained question the expert can \
+answer with no other context>\n\
+\n\
+Frame the SUBAGENT_PROMPT as a fully-specified query — the subagent will \
+not see this conversation. Give your best direct answer first if you have \
+one, then the SUBAGENT_PROMPT line if you'd like it verified or extended. \
+If you're confident, omit the SUBAGENT_PROMPT line entirely.";
 
 fn parse_args() -> Result<Args, String> {
     let mut socket_path: Option<PathBuf> = None;
@@ -124,6 +161,7 @@ fn parse_args() -> Result<Args, String> {
     let mut litertlm_visual_token_budget: i32 = 512;
     let mut litertlm_prefix_cache_size: usize = 8;
     let mut litertlm_prefix_cache_ttl_secs: u64 = 900;
+    let mut litertlm_system_prompt: Option<String> = Some(DEFAULT_LITERTLM_SYSTEM_PROMPT.to_string());
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -189,6 +227,20 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| "--litertlm-session-ttl-secs needs a value".to_string())?
                     .parse().map_err(|e| format!("--litertlm-session-ttl-secs: {e}"))?;
             }
+            "--litertlm-system-prompt" => {
+                let v = args.next().ok_or_else(|| "--litertlm-system-prompt needs a value".to_string())?;
+                litertlm_system_prompt = Some(if let Some(path) = v.strip_prefix('@') {
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("--litertlm-system-prompt @{path}: {e}"))?
+                        .trim_end_matches('\n')
+                        .to_string()
+                } else {
+                    v
+                });
+            }
+            "--litertlm-no-system-prompt" => {
+                litertlm_system_prompt = None;
+            }
             "--max-tokens" => {
                 max_tokens = args.next()
                     .ok_or_else(|| "--max-tokens needs a value".to_string())?
@@ -210,6 +262,8 @@ fn parse_args() -> Result<Args, String> {
                           [--litertlm-visual-token-budget <N>] \\
                           [--litertlm-prefix-cache-size <N>] \\
                           [--litertlm-prefix-cache-ttl-secs <S>] \\
+                          [--litertlm-system-prompt <text|@file>] \\
+                          [--litertlm-no-system-prompt] \\
                           [--max-tokens <N>] [--max-seq-len <N>]"
                 );
                 std::process::exit(0);
@@ -232,6 +286,7 @@ fn parse_args() -> Result<Args, String> {
         litertlm_visual_token_budget,
         litertlm_prefix_cache_size,
         litertlm_prefix_cache_ttl_secs,
+        litertlm_system_prompt,
     })
 }
 
@@ -318,9 +373,12 @@ fn build_litertlm_slot(args: &Args) -> Result<Arc<dyn SlotHandle>, String> {
     let ttl = std::time::Duration::from_secs(args.litertlm_prefix_cache_ttl_secs);
     log::info!(
         "[model_api] litert-lm loading: {} (name={}, accel={}, max_num_tokens={}, \
-         vtb={:?}, prefix_cache_size={}, ttl={:?})",
+         vtb={:?}, prefix_cache_size={}, ttl={:?}, system_prompt={})",
         model_path.display(), model_name, args.litertlm_accel, args.litertlm_max_num_tokens,
         vtb, args.litertlm_prefix_cache_size, ttl,
+        args.litertlm_system_prompt.as_ref()
+            .map(|s| format!("{}B", s.len()))
+            .unwrap_or_else(|| "off".into()),
     );
     let slot = model_api_server::litertlm_slot::LiteRtLmSlot::new(
         model_path.clone(),
@@ -330,6 +388,7 @@ fn build_litertlm_slot(args: &Args) -> Result<Arc<dyn SlotHandle>, String> {
         vtb,
         args.litertlm_prefix_cache_size,
         ttl,
+        args.litertlm_system_prompt.clone(),
     )?;
     Ok(Arc::new(slot))
 }

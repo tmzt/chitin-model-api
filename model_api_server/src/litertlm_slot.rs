@@ -129,6 +129,17 @@ pub struct LiteRtLmSlot {
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     cache_size: usize,
     ttl: Duration,
+    /// Slot-wide default system prompt. Applied via
+    /// `Engine::create_conversation_with_system` on every cache MISS,
+    /// so the system tokens are prefilled into the KV cache and
+    /// inherited by any `Conversation::clone` off that donor. Per-
+    /// request `inference_config.system_prompt` overrides this when
+    /// set; otherwise this default is used. `None` -> no system
+    /// message (model defaults from the .litertlm chat template).
+    /// The effective system prompt is included in the prefix-cache
+    /// hash, so a slot-default vs request-override produces distinct
+    /// cache entries.
+    default_system_prompt: Option<Arc<String>>,
 }
 
 impl LiteRtLmSlot {
@@ -140,6 +151,7 @@ impl LiteRtLmSlot {
         visual_token_budget: Option<i32>,
         cache_size: usize,
         ttl: Duration,
+        default_system_prompt: Option<String>,
     ) -> Result<Self, String> {
         let settings = EngineSettings::new(model_path)
             .backend(backend)
@@ -162,6 +174,7 @@ impl LiteRtLmSlot {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cache_size: cache_size.max(1),
             ttl,
+            default_system_prompt: default_system_prompt.map(Arc::new),
         })
     }
 
@@ -349,7 +362,17 @@ impl SlotHandle for LiteRtLmSlot {
             SessionMode::Stateless => None,
         };
 
-        let system_prompt = req.req.inference_config.system_prompt.clone();
+        // Effective system prompt: per-request override wins, falling
+        // back to the slot-wide default the operator configured at
+        // startup. Folded into the prefix-cache hash below so a
+        // request-override and the default land in distinct cache
+        // entries (different system tokens → different prefilled KV).
+        let system_prompt = req
+            .req
+            .inference_config
+            .system_prompt
+            .clone()
+            .or_else(|| self.default_system_prompt.as_ref().map(|s| (**s).clone()));
         let turns: Vec<Turn> = input_to_turns(&req.req.input)?;
 
         if turns.is_empty() {
@@ -476,9 +499,18 @@ impl SlotHandle for LiteRtLmSlot {
                         // so a slow create_conversation doesn't
                         // block other lookups.
                         drop(cache);
-                        let mut conv = engine
-                            .create_conversation(sampler)
-                            .map_err(|e| format!("litertlm create_conversation: {e}"))?;
+                        // Use the system-prompt-aware path when one is
+                        // set so the system tokens are prefilled into
+                        // KV before any user turn — survives
+                        // Conversation::clone() into the cache.
+                        let mut conv = match sys_for_task.as_deref() {
+                            Some(sys) => engine
+                                .create_conversation_with_system(sampler, sys)
+                                .map_err(|e| format!("litertlm create_conversation_with_system: {e}"))?,
+                            None => engine
+                                .create_conversation(sampler)
+                                .map_err(|e| format!("litertlm create_conversation: {e}"))?,
+                        };
                         if let Some(b) = vtb {
                             conv = conv.with_visual_token_budget(b);
                         }
@@ -596,6 +628,32 @@ impl SlotHandle for LiteRtLmSlot {
             phase: Some("text".into()),
         });
 
+        // RLM fallback hook: when the system prompt instructs the
+        // model to escalate, it ends its response with one or more
+        // `SUBAGENT_PROMPT:` lines. Log them here so they show up in
+        // model-api.log; actual subagent dispatch is a follow-up.
+        log_subagent_prompts(&text);
+
         Ok(build_response(text, session_id))
+    }
+}
+
+/// Scan an assistant response for `SUBAGENT_PROMPT:` markers (case-
+/// sensitive, line-anchored) and emit one INFO log line per match.
+/// The marker is the contract baked into the slot's default system
+/// prompt — when the model wants to escalate an answer it doesn't
+/// know, it terminates the response with `SUBAGENT_PROMPT: <query>`.
+/// For now this is observe-only; a follow-up will route the query
+/// to an actual subagent and inject the response.
+fn log_subagent_prompts(text: &str) {
+    const MARKER: &str = "SUBAGENT_PROMPT:";
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(MARKER) {
+            let prompt = rest.trim();
+            if !prompt.is_empty() {
+                log::info!("[litertlm] SUBAGENT_PROMPT: {prompt}");
+            }
+        }
     }
 }
