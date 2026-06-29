@@ -38,7 +38,7 @@ llama-cpp = ["dep:thinker_impl", "dep:common"]
 #         --target aarch64-linux-android
 # litert-sys (the TFLite runtime, pulled transitively) auto-downloads
 # its libLiteRt.so from Google Maven AAR for android_arm64.
-litert-lm = ["dep:litertlm", "dep:litert-lm-sys"]
+litert-lm = ["dep:litertlm", "dep:litert-lm-sys", "dep:xxhash-rust"]
 
 [lib]
 path = "src/lib.rs"
@@ -68,7 +68,17 @@ common = { path = "../common", optional = true }
 #      signature with `LiteRtLmConversationOptionalArgs*` for
 #      `visual_token_budget` (required for multimodal Gemma-4 even
 #      on pure-text sends).
+#   3. Use `Conversation::clone()` (KV-state deep copy) to share a
+#      prefilled system-prompt prefix across sessions in the
+#      content-hash-keyed prefix cache.
 # Toggle the `litert-lm-sys/generate-bindings` feature so bindgen
 # regenerates the FFI at build time against the v0.13.1 header.
 litertlm = { path = "../deps/litert-rs/litert-lm", optional = true }
 litert-lm-sys = { path = "../deps/litert-rs/litert-lm-sys", features = ["generate-bindings"], optional = true }
+
+# Content-hash for the LiteRT-LM prefix cache. Same hash family
+# (xxh3_128 → upper 64 bits) as `common::util::xxhash3_hex16` so
+# cache keys round-trip cleanly with anything else in the workspace
+# that fingerprints by xxh3. Optional + folded under the litert-lm
+# feature — no-feature builds don't pay the dep.
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }

@@ -87,18 +87,26 @@ struct Args {
     /// 0 -> pass NULL (text-only model files).
     #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
     litertlm_visual_token_budget: i32,
-    /// LiteRT-LM Conversation pool capacity (LRU). Default 8.
-    /// Multi-turn voice conversations keep one Conversation per
-    /// distinct `session_id`; the pool serves N concurrent
-    /// sessions before evicting the least-recently-used.
+    /// LiteRT-LM prefix-cache capacity (LRU). Default 8. Each entry
+    /// is one cached Conversation keyed by the content-hash of its
+    /// prefix (system_prompt + sampler_config + turns[..N]); the
+    /// cache serves N distinct prefixes before evicting the
+    /// least-recently-used. Identical prefixes across different
+    /// wire `session_id`s share the same cache entry.
+    ///
+    /// Deprecated alias: `--litertlm-session-pool-size` (kept so
+    /// chitin-stack.sh / supervisor.toml don't break through the
+    /// rename).
     #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
-    litertlm_session_pool_size: usize,
-    /// TTL after which a pooled Conversation is treated as a cold
+    litertlm_prefix_cache_size: usize,
+    /// TTL after which a cached prefix entry is treated as a cold
     /// miss (re-created from scratch). Default 900 seconds.
-    /// Prevents stale sessions from holding GPU memory after the
+    /// Prevents stale entries from holding GPU memory after the
     /// user has clearly moved on.
+    ///
+    /// Deprecated alias: `--litertlm-session-ttl-secs`.
     #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
-    litertlm_session_ttl_secs: u64,
+    litertlm_prefix_cache_ttl_secs: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -114,8 +122,8 @@ fn parse_args() -> Result<Args, String> {
     let mut litertlm_accel: String = "gpu".into();
     let mut litertlm_max_num_tokens: i32 = 4096;
     let mut litertlm_visual_token_budget: i32 = 512;
-    let mut litertlm_session_pool_size: usize = 8;
-    let mut litertlm_session_ttl_secs: u64 = 900;
+    let mut litertlm_prefix_cache_size: usize = 8;
+    let mut litertlm_prefix_cache_ttl_secs: u64 = 900;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -147,13 +155,37 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| "--litertlm-visual-token-budget needs a value".to_string())?
                     .parse().map_err(|e| format!("--litertlm-visual-token-budget: {e}"))?;
             }
+            "--litertlm-prefix-cache-size" => {
+                litertlm_prefix_cache_size = args.next()
+                    .ok_or_else(|| "--litertlm-prefix-cache-size needs a value".to_string())?
+                    .parse().map_err(|e| format!("--litertlm-prefix-cache-size: {e}"))?;
+            }
+            // Deprecated alias for --litertlm-prefix-cache-size. The
+            // cache was renamed when the keying scheme moved from
+            // session_id to content-hash; existing supervisor.toml /
+            // chitin-stack.sh still pass the old name and we don't
+            // want to break the demo while they're rolled forward.
             "--litertlm-session-pool-size" => {
-                litertlm_session_pool_size = args.next()
+                log::warn!(
+                    "--litertlm-session-pool-size is deprecated; \
+                     use --litertlm-prefix-cache-size",
+                );
+                litertlm_prefix_cache_size = args.next()
                     .ok_or_else(|| "--litertlm-session-pool-size needs a value".to_string())?
                     .parse().map_err(|e| format!("--litertlm-session-pool-size: {e}"))?;
             }
+            "--litertlm-prefix-cache-ttl-secs" => {
+                litertlm_prefix_cache_ttl_secs = args.next()
+                    .ok_or_else(|| "--litertlm-prefix-cache-ttl-secs needs a value".to_string())?
+                    .parse().map_err(|e| format!("--litertlm-prefix-cache-ttl-secs: {e}"))?;
+            }
+            // Deprecated alias for --litertlm-prefix-cache-ttl-secs.
             "--litertlm-session-ttl-secs" => {
-                litertlm_session_ttl_secs = args.next()
+                log::warn!(
+                    "--litertlm-session-ttl-secs is deprecated; \
+                     use --litertlm-prefix-cache-ttl-secs",
+                );
+                litertlm_prefix_cache_ttl_secs = args.next()
                     .ok_or_else(|| "--litertlm-session-ttl-secs needs a value".to_string())?
                     .parse().map_err(|e| format!("--litertlm-session-ttl-secs: {e}"))?;
             }
@@ -176,8 +208,8 @@ fn parse_args() -> Result<Args, String> {
                           [--llama-ngl <N>] \\
                           [--litertlm-accel gpu|cpu] [--litertlm-max-num-tokens <N>] \\
                           [--litertlm-visual-token-budget <N>] \\
-                          [--litertlm-session-pool-size <N>] \\
-                          [--litertlm-session-ttl-secs <S>] \\
+                          [--litertlm-prefix-cache-size <N>] \\
+                          [--litertlm-prefix-cache-ttl-secs <S>] \\
                           [--max-tokens <N>] [--max-seq-len <N>]"
                 );
                 std::process::exit(0);
@@ -198,8 +230,8 @@ fn parse_args() -> Result<Args, String> {
         litertlm_accel,
         litertlm_max_num_tokens,
         litertlm_visual_token_budget,
-        litertlm_session_pool_size,
-        litertlm_session_ttl_secs,
+        litertlm_prefix_cache_size,
+        litertlm_prefix_cache_ttl_secs,
     })
 }
 
@@ -283,12 +315,12 @@ fn build_litertlm_slot(args: &Args) -> Result<Arc<dyn SlotHandle>, String> {
     } else {
         None
     };
-    let ttl = std::time::Duration::from_secs(args.litertlm_session_ttl_secs);
+    let ttl = std::time::Duration::from_secs(args.litertlm_prefix_cache_ttl_secs);
     log::info!(
         "[model_api] litert-lm loading: {} (name={}, accel={}, max_num_tokens={}, \
-         vtb={:?}, pool_size={}, ttl={:?})",
+         vtb={:?}, prefix_cache_size={}, ttl={:?})",
         model_path.display(), model_name, args.litertlm_accel, args.litertlm_max_num_tokens,
-        vtb, args.litertlm_session_pool_size, ttl,
+        vtb, args.litertlm_prefix_cache_size, ttl,
     );
     let slot = model_api_server::litertlm_slot::LiteRtLmSlot::new(
         model_path.clone(),
@@ -296,7 +328,7 @@ fn build_litertlm_slot(args: &Args) -> Result<Arc<dyn SlotHandle>, String> {
         backend,
         args.litertlm_max_num_tokens,
         vtb,
-        args.litertlm_session_pool_size,
+        args.litertlm_prefix_cache_size,
         ttl,
     )?;
     Ok(Arc::new(slot))
