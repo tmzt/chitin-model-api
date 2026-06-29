@@ -163,10 +163,21 @@ impl LiteRtLmSlot {
         cache_size: usize,
         ttl: Duration,
         default_system_prompt: Option<String>,
+        engine_cache_dir: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let settings = EngineSettings::new(model_path)
+        let mut settings = EngineSettings::new(model_path)
             .backend(backend)
             .max_num_tokens(max_num_tokens);
+        if let Some(dir) = engine_cache_dir {
+            // EngineSettings::cache_dir → C
+            // `litert_lm_engine_settings_set_cache_dir`. Stores
+            // compiled OpenCL kernels + any preprocessed weights so
+            // the next cold start skips the bulk of the PowerVR
+            // delegate's first-load build (~30-60s today). Distinct
+            // from the per-prefix KV cache LiteRtLmSlot already
+            // maintains in-memory.
+            settings = settings.cache_dir(dir);
+        }
         let engine = Engine::new(settings)
             .map_err(|e| format!("litertlm Engine::new: {e}"))?;
         // v0.13's sampler_factory only implements TYPE_UNSPECIFIED

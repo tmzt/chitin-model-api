@@ -118,6 +118,15 @@ struct Args {
     /// `--litertlm-no-system-prompt` disables the default entirely.
     #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
     litertlm_system_prompt: Option<String>,
+    /// Engine-level model cache directory. Distinct from the prefix
+    /// (KV) cache above — this is where LiteRT-LM persists compiled
+    /// OpenCL kernels and any preprocessed model weights derived at
+    /// load time, so the next cold start skips the bulk of the
+    /// PowerVR delegate's first-load setup (~30-60s on Pixel). Set
+    /// via `EngineSettings::cache_dir`. None = no on-disk cache;
+    /// every load re-builds from scratch.
+    #[cfg_attr(not(feature = "litert-lm"), allow(dead_code))]
+    litertlm_cache_dir: Option<PathBuf>,
 }
 
 /// Baked-in default system prompt for the LiteRT-LM backend.
@@ -162,6 +171,7 @@ fn parse_args() -> Result<Args, String> {
     let mut litertlm_prefix_cache_size: usize = 8;
     let mut litertlm_prefix_cache_ttl_secs: u64 = 900;
     let mut litertlm_system_prompt: Option<String> = Some(DEFAULT_LITERTLM_SYSTEM_PROMPT.to_string());
+    let mut litertlm_cache_dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -241,6 +251,9 @@ fn parse_args() -> Result<Args, String> {
             "--litertlm-no-system-prompt" => {
                 litertlm_system_prompt = None;
             }
+            "--litertlm-cache-dir" => {
+                litertlm_cache_dir = args.next().map(PathBuf::from);
+            }
             "--max-tokens" => {
                 max_tokens = args.next()
                     .ok_or_else(|| "--max-tokens needs a value".to_string())?
@@ -264,6 +277,7 @@ fn parse_args() -> Result<Args, String> {
                           [--litertlm-prefix-cache-ttl-secs <S>] \\
                           [--litertlm-system-prompt <text|@file>] \\
                           [--litertlm-no-system-prompt] \\
+                          [--litertlm-cache-dir <dir>] \\
                           [--max-tokens <N>] [--max-seq-len <N>]"
                 );
                 std::process::exit(0);
@@ -287,6 +301,7 @@ fn parse_args() -> Result<Args, String> {
         litertlm_prefix_cache_size,
         litertlm_prefix_cache_ttl_secs,
         litertlm_system_prompt,
+        litertlm_cache_dir,
     })
 }
 
@@ -402,13 +417,24 @@ fn build_litertlm_slot(args: &Args) -> Result<Arc<dyn SlotHandle>, String> {
         None
     };
     let ttl = std::time::Duration::from_secs(args.litertlm_prefix_cache_ttl_secs);
+    if let Some(ref cache_dir) = args.litertlm_cache_dir {
+        if let Err(e) = std::fs::create_dir_all(cache_dir) {
+            log::warn!(
+                "[model_api] --litertlm-cache-dir {}: mkdir failed: {e} — engine will run uncached",
+                cache_dir.display(),
+            );
+        }
+    }
     log::info!(
         "[model_api] litert-lm loading: {} (name={}, accel={}, max_num_tokens={}, \
-         vtb={:?}, prefix_cache_size={}, ttl={:?}, system_prompt={})",
+         vtb={:?}, prefix_cache_size={}, ttl={:?}, system_prompt={}, model_cache_dir={})",
         model_path.display(), model_name, args.litertlm_accel, args.litertlm_max_num_tokens,
         vtb, args.litertlm_prefix_cache_size, ttl,
         args.litertlm_system_prompt.as_ref()
             .map(|s| format!("{}B", s.len()))
+            .unwrap_or_else(|| "off".into()),
+        args.litertlm_cache_dir.as_ref()
+            .map(|p| p.display().to_string())
             .unwrap_or_else(|| "off".into()),
     );
     let slot = model_api_server::litertlm_slot::LiteRtLmSlot::new(
@@ -420,6 +446,7 @@ fn build_litertlm_slot(args: &Args) -> Result<Arc<dyn SlotHandle>, String> {
         args.litertlm_prefix_cache_size,
         ttl,
         args.litertlm_system_prompt.clone(),
+        args.litertlm_cache_dir.clone(),
     )?;
     Ok(Arc::new(slot))
 }
