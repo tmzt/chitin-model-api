@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use litertlm::{Backend, Conversation, Engine, EngineSettings, SamplerParams};
+use litertlm::{Backend, CancelHandle, Conversation, Engine, EngineSettings, SamplerParams};
 use model_api_proto::{InferenceInput, InferenceResponse, Role, SessionMode, StreamChunk, Turn};
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -140,6 +140,17 @@ pub struct LiteRtLmSlot {
     /// hash, so a slot-default vs request-override produces distinct
     /// cache entries.
     default_system_prompt: Option<Arc<String>>,
+    /// Cancel handle for the currently-streaming Conversation, set
+    /// just before `send_message_stream` runs and cleared just
+    /// after. The SIGUSR2 watcher thread in `main.rs` reads this
+    /// under-lock and calls `.cancel()` on any present handle — the
+    /// blocked `send_message_stream` returns early. Lock ordering
+    /// is "handler reads + cancels while holding the lock; slot
+    /// clears while holding the lock", which closes the race
+    /// against `Conversation::drop` invalidating the underlying C
+    /// pointer (the handler can't pick up a stale handle once the
+    /// slot has cleared it).
+    cancel_token: Arc<Mutex<Option<CancelHandle>>>,
 }
 
 impl LiteRtLmSlot {
@@ -175,7 +186,17 @@ impl LiteRtLmSlot {
             cache_size: cache_size.max(1),
             ttl,
             default_system_prompt: default_system_prompt.map(Arc::new),
+            cancel_token: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Hand a clone of the cancel-token Arc to `main.rs` so its
+    /// SIGUSR2 watcher thread can call `.cancel()` on the
+    /// in-flight inference (if any). The thread holds the Arc; it
+    /// reads the Option under-lock and triggers a cancel without
+    /// going through the slot's async dispatch.
+    pub fn cancel_token(&self) -> Arc<Mutex<Option<CancelHandle>>> {
+        Arc::clone(&self.cancel_token)
     }
 
     fn sampler_for_request(&self, req: &SlotRequest) -> SamplerParams {
@@ -342,6 +363,22 @@ impl SlotHandle for LiteRtLmSlot {
         None
     }
 
+    /// SIGUSR2 entry point. Returns true if a cancel was actually
+    /// triggered (the slot had a live conversation in flight),
+    /// false if nothing was streaming. Holds the cancel_token mutex
+    /// for the duration of the C call — that's what makes the
+    /// race against `Conversation::drop` impossible (the slot's
+    /// own clear path also takes this lock).
+    fn cancel_in_flight(&self) -> bool {
+        let guard = self.cancel_token.lock().unwrap();
+        if let Some(handle) = guard.as_ref() {
+            handle.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     async fn run(&self, req: SlotRequest) -> Result<SlotResponse, String> {
         // Non-streaming = streaming with a discarding sink. Both
         // paths funnel through send_message_stream so the
@@ -401,6 +438,7 @@ impl SlotHandle for LiteRtLmSlot {
         let sys_for_task = system_prompt;
         let session_id_for_task = session_id.clone();
         let turns_for_task = turns;
+        let cancel_token = self.cancel_token.clone();
 
         // All Conversation work — lookup, clone, send, re-cache —
         // happens on the blocking pool. Conversation::clone is a
@@ -533,6 +571,15 @@ impl SlotHandle for LiteRtLmSlot {
                 );
             }
 
+            // Arm the cancel token for the duration of the send loop.
+            // The RAII guard clears it on any exit path (success,
+            // error, panic) so the SIGUSR2 watcher never sees a stale
+            // handle pointing at a dropped Conversation.
+            let _cancel_guard = ArmCancel::new(
+                Arc::clone(&cancel_token),
+                conv.cancel_handle(),
+            );
+
             let mut last_response = String::new();
             for (i, msg) in replay_msgs.iter().enumerate() {
                 let is_last = i + 1 == replay_msgs.len();
@@ -549,6 +596,7 @@ impl SlotHandle for LiteRtLmSlot {
                 }
             }
             drop(tx);
+            drop(_cancel_guard);
 
             // ── Re-cache the advanced Conversation ──────────────
             //
@@ -645,6 +693,28 @@ impl SlotHandle for LiteRtLmSlot {
 /// know, it terminates the response with `SUBAGENT_PROMPT: <query>`.
 /// For now this is observe-only; a follow-up will route the query
 /// to an actual subagent and inject the response.
+/// RAII guard that installs a [`CancelHandle`] into the slot's
+/// cancel-token slot for the duration of the in-process
+/// `send_message_stream` loop. Drop clears the slot — including
+/// on panic, error-propagation, or early return — so the SIGUSR2
+/// watcher never holds a handle pointing at a dropped Conversation.
+struct ArmCancel {
+    token: Arc<Mutex<Option<CancelHandle>>>,
+}
+
+impl ArmCancel {
+    fn new(token: Arc<Mutex<Option<CancelHandle>>>, handle: CancelHandle) -> Self {
+        *token.lock().unwrap() = Some(handle);
+        Self { token }
+    }
+}
+
+impl Drop for ArmCancel {
+    fn drop(&mut self) {
+        *self.token.lock().unwrap() = None;
+    }
+}
+
 fn log_subagent_prompts(text: &str) {
     const MARKER: &str = "SUBAGENT_PROMPT:";
     for line in text.lines() {

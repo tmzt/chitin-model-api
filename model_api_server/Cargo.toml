@@ -54,6 +54,10 @@ async-trait = "0.1"
 futures-lite = "2"
 log = "0.4"
 env_logger = "0.11"
+# SIGUSR2 watcher — cancels in-flight inference via LiteRtLmSlot's
+# CancelHandle. Uses signal_hook::iterator::Signals for blocking
+# receive (no AtomicBool wakeup gap to lose a signal through).
+signal-hook = "0.3"
 
 # Backend wiring — present only with the `llama-cpp` feature.
 thinker_impl = { path = "../thinker_impl", features = ["llama-cpp"], optional = true }

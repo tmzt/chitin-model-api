@@ -298,7 +298,38 @@ fn main() -> Result<(), String> {
     log::info!("[model_api] backend: {kind:?}");
     let slot: Arc<dyn SlotHandle> = build_slot(kind, &args)?;
 
+    // SIGUSR2 watcher — calls slot.cancel_in_flight() on each
+    // signal. Default trait impl is a no-op; only LiteRtLmSlot
+    // surfaces the underlying upstream cancel via its CancelHandle.
+    // Use signal_hook's Signals iterator so the watcher blocks
+    // cleanly between fires (no busy poll, no AtomicBool wakeup
+    // gap to lose a signal through).
+    spawn_usr2_watcher(Arc::clone(&slot));
+
     smol::block_on(serve(args.socket_path, slot))
+}
+
+fn spawn_usr2_watcher(slot: Arc<dyn SlotHandle>) {
+    use signal_hook::iterator::Signals;
+    let mut signals = match Signals::new([signal_hook::consts::SIGUSR2]) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("[model_api] failed to register SIGUSR2 watcher: {e}");
+            return;
+        }
+    };
+    std::thread::Builder::new()
+        .name("usr2-watcher".into())
+        .spawn(move || {
+            for _ in signals.forever() {
+                let cancelled = slot.cancel_in_flight();
+                log::info!(
+                    "[model_api] SIGUSR2 — cancel_in_flight={}",
+                    if cancelled { "delivered" } else { "no inference in flight" },
+                );
+            }
+        })
+        .expect("spawn usr2-watcher thread");
 }
 
 /// When the user doesn't pass `--backend`, pick the first viable

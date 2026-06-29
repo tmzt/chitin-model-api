@@ -84,6 +84,20 @@ pub trait SlotHandle: Send + Sync {
     ) -> Result<SlotResponse, String> {
         self.run(req).await
     }
+
+    /// Best-effort cancel of an in-flight inference. Default impl is
+    /// a no-op for slots whose backend doesn't expose cancellation
+    /// (subprocess, stub, llama-cpp today). LiteRtLmSlot overrides
+    /// this to call the upstream `litert_lm_conversation_cancel_process`
+    /// via its CancelHandle, which makes the blocked
+    /// `send_message_stream` return early.
+    ///
+    /// Called from the `chitin-model-api` SIGUSR2 watcher thread,
+    /// which fires asynchronously to the slot's main dispatch — so
+    /// this method MUST be safe to call concurrently with run/
+    /// run_stream. Returns true if a cancel was actually delivered
+    /// (an inference was in flight), false otherwise.
+    fn cancel_in_flight(&self) -> bool { false }
 }
 
 // ── Stub for tests ──────────────────────────────────────────────────
