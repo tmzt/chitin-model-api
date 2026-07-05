@@ -13,6 +13,7 @@
 [workspace]
 members = [
     "gemma_utils",
+    "chitin_llama",
     "model_api_proto",
     "model_api_client",
     # model_api_server temporarily excluded during the phase-2/3/4

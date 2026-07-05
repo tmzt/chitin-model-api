@@ -1,0 +1,39 @@
+[package]
+name = "chitin_llama"
+version = "0.1.0"
+edition = "2021"
+
+# Direct llama.cpp integration for `model_api_server`. Ported from
+# the parent workspace's `llama_engine` crate, stripped of its
+# `common::handles` / `thinker_helper::inference_types` abstractions
+# so this crate stands on its own. Session + prefix cache + MTP
+# speculative decode + prompt construction; no in-process tool
+# dispatcher (server operates in wire-passthrough mode — clients
+# handle tool calls).
+
+[dependencies]
+model_api_proto = { path = "../model_api_proto" }
+gemma_utils = { path = "../gemma_utils" }
+
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Pure-Rust Jinja interpreter. The GGUF chat template for Gemma 4
+# (~16KB of Jinja, with macros + `tools` iteration) needs a real
+# Jinja engine — llama.cpp's built-in `llama_chat_apply_template` is
+# a hand-rolled substring matcher and refuses the Gemma 4 template
+# with FfiError(-1). minijinja handles the full template + supports
+# the `tools=[...]` parameter that activates the model's native
+# tool-call mode.
+minijinja = { version = "2", default-features = false, features = ["builtins", "macros"] }
+
+# UTF-8 streaming for llama-cpp-2's token_to_piece API.
+encoding_rs = "0.8"
+
+# Path-dep on our vendored fork (submoduled at deps/llama-cpp-2),
+# which pins the PR22673-tracking llama.cpp at deps/llama.cpp via a
+# relative symlink. See top-level README + the fork's own README
+# for the rationale.
+llama-cpp-sys-2 = { path = "../deps/llama-cpp-2/llama-cpp-sys-2" }
+llama-cpp-2 = { path = "../deps/llama-cpp-2/llama-cpp-2", features = ["sampler"] }
