@@ -9,7 +9,7 @@
 //! raw-text path where the model emits tool-call markers inline
 //! with the response and we have to scan for them.
 
-use common::tool_format::ToolFormat;
+use gemma_utils::tool_format::ToolFormat;
 use model_api_proto::{Role, ToolCall, ToolResult, Turn};
 
 /// Wrap one tool result via the active model's `ToolFormat`.
@@ -107,7 +107,7 @@ pub fn extract_tool_calls(text: &str, tool_format: &dyn ToolFormat) -> Vec<ToolC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::tool_format::Gemma4ToolFormat;
+    use gemma_utils::tool_format::Gemma4ToolFormat;
 
     #[test]
     fn extract_zero_calls_from_plain_text() {

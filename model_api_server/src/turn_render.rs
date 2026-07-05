@@ -1,6 +1,6 @@
 //! Turn-list → chat-template string renderer for the LlamaSlot path.
 //!
-//! `model_api_proto::Turn` is the wire shape; `common::chat_format::ChatFormat`
+//! `model_api_proto::Turn` is the wire shape; `gemma_utils::chat_format::ChatFormat`
 //! is the per-model template (Gemma4Format, ChatMLFormat, …). This
 //! module is the join point — a free function that loops a Turn list
 //! through the format's per-role wrappers and tacks the
@@ -11,7 +11,7 @@
 //! leaf crate that intentionally doesn't depend on `model_api_proto`
 //! — only the slot ever needs to join the two.
 
-use common::chat_format::ChatFormat;
+use gemma_utils::chat_format::ChatFormat;
 use model_api_proto::{Role, Turn};
 
 /// Render a turn list using the model's `ChatFormat`. Returns a
@@ -64,7 +64,7 @@ pub fn render_turns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::chat_format::Gemma4Format;
+    use gemma_utils::chat_format::Gemma4Format;
 
     #[test]
     fn renders_simple_user_turn() {
