@@ -1,0 +1,2 @@
+<|channel>thought
+<channel|><|tool_call>call:write{"path":"x.py","content":"print('placeholder')"}<tool_call|>

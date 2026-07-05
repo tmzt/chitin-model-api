@@ -1,0 +1,20 @@
+[package]
+name = "gemma_utils"
+version = "0.1.0"
+edition = "2021"
+
+# Chat template + tool-call marker parsing for Gemma 4 (and a couple
+# of sibling model families). Kept small: the trait surface + the
+# Gemma4 / ChatML / Raw concrete impls, with just the parse-side
+# helpers `model_api_server` actually calls. Client-side rendering
+# of tool catalogs (`system_prompt_fragment`, `format_gate_response`)
+# lives elsewhere — it needs a tools-registry abstraction that's out
+# of scope for the wire path.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# json_lenient uses these — the tolerant tool-args parser needs
+# multi-pattern regex matching for structural quote reconstruction.
+regex = "1"
+once_cell = "1"

@@ -1,0 +1,35 @@
+# Workspace root for standalone builds of chitin-model-api.
+#
+# When this repo is consumed as `deps/model_api/` inside a parent
+# workspace (memory-core-demo), the parent's Cargo.toml claims the
+# four crates as its own workspace members and this file is IGNORED
+# (Cargo picks the outermost workspace). This file is only active
+# for standalone clones.
+#
+# `model_api_node` is excluded from workspace + default-members: it
+# builds as a napi-rs cdylib (`napi build`), not a normal cargo bin,
+# and pulls tokio which unifies awkwardly with the smol-based server.
+
+[workspace]
+members = [
+    "gemma_utils",
+    "model_api_proto",
+    "model_api_client",
+    # model_api_server temporarily excluded during the phase-2/3/4
+    # refactor — its Cargo.toml still path-deps into ../common and
+    # ../thinker_impl (parent-workspace crates that don't exist here).
+    # Re-added in phase 4 once llama_slot has been rewritten to use
+    # the in-tree chitin_llama + gemma_utils + proto types.
+    # "model_api_server",
+]
+exclude = [
+    # Temporary during phase 2/3 — see note above.
+    "model_api_server",
+    # napi-rs cdylib, built via `napi build` not plain cargo.
+    "model_api_node",
+    # Submodules — each has its own workspace root.
+    "deps/litert-rs",
+    "deps/llama-cpp-2",
+    "deps/llama.cpp",
+]
+resolver = "2"
