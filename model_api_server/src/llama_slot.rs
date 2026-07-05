@@ -1,130 +1,102 @@
-//! Production [`SlotHandle`] backed by `thinker_impl::spawn_resource`.
+//! Production [`SlotHandle`] backed by an in-tree
+//! [`chitin_llama::Session`].
 //!
-//! Owns the in-process llama slot (single slot, sized at server
-//! startup) and bridges the wire types in [`crate::slot::SlotRequest`]
-//! /[`SlotResponse`] to `common::handles::ThinkerRequest` /
-//! `ThinkerResponse`. The translation mirrors what
-//! `thinker_impl::model_api_remote` does on the client side, just in
-//! reverse.
+//! Owns the loaded llama.cpp model directly. Renders prompts with
+//! `gemma_utils::ChatFormat`, generates tokens through
+//! `Session::generate_raw`, and (in client mode) parses tool-call
+//! markers back out with `gemma_utils::ToolFormat` — no parent-
+//! workspace `thinker_impl` / `common::handles` indirection.
 //!
 //! Tool calls are handled per-request via [`proto::ToolMode`]:
-//!  - `Server` — leave `raw_tool_call` off, in-band dispatcher
-//!     executes calls server-side, results are spliced into the
-//!     model's continuation. Response carries `injections` but not
-//!     `tool_calls`.
-//!  - `Client` — set `raw_tool_call` so the model's tool-call
-//!     markers stay in the output. After generation, scan the text
-//!     for `<tool_open>...<tool_close>` pairs using the loaded
-//!     model's [`ToolFormat`], extract each into a `ToolCall`, and
-//!     ship them in the response. Client (e.g. pi-ai) executes the
-//!     tool externally and sends the result back via
-//!     [`InferenceRequest::tool_results`] on the next turn.
-//!  - `Auto` — `Client` when the request carries tools, else
-//!     `Server`. Matches the OpenAI-style agent-loop expectation.
+//!   - `Server` — model output is returned as text; markers stay
+//!     verbatim but no `tool_calls` are surfaced. Callers that
+//!     want in-line dispatch have to layer it themselves.
+//!   - `Client` — after generation, the raw text is scanned with
+//!     the active `ToolFormat` and extracted `ToolCall`s ride
+//!     alongside `text` on the response. Client (pi-ai, chitin's
+//!     agent runtime, etc.) executes the tool and returns the
+//!     result on the next turn as `InferenceRequest::tool_results`.
+//!   - `Auto` — `Client` when the request carries tools, else
+//!     `Server`.
 //!
-//! Cancellation, streaming chunks, and progress events are still
-//! TODOs — the server delivers a single InferenceComplete per
-//! request today.
+//! Cancellation and streaming chunk / progress events are still
+//! TODOs — the slot delivers a single response per request today.
+//! When streaming is asked for, the sink still receives a
+//! bracketing `queued` + `gen_start` + `gen_done` progress trio
+//! plus a single chunk with the full text so wire consumers that
+//! expect any events don't stall.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use common::handles::{
-    GpuRole as CommonRole, InferenceConfig as CommonInferenceConfig,
-    InferenceInput as CommonInput, JsonMode as CommonJsonMode, KvCacheMode,
-    SessionMode as CommonSession, ThinkerRequest, ThinkerResource,
-};
-use common::chat_format::{ChatFormat, Gemma4Format};
-use common::tool_format::{Gemma4ToolFormat, ToolFormat};
-use common::types::{ExternalToolDef, ExternalToolParam};
+use chitin_llama::{LoadConfig, Session};
+use gemma_utils::{ChatFormat, Gemma4Format, Gemma4ToolFormat, ToolFormat};
 use model_api_proto::{
-    GpuRole, InferenceInput, InferenceResponse, JsonMode, SessionMode,
-    SessionReplacement, ToolDef, ToolMode,
+    InferenceInput, InferenceResponse, ToolMode,
 };
-use thinker_impl::ThinkerConfig;
 
 use crate::slot::{SlotHandle, SlotRequest, SlotResponse, StreamSink};
 use crate::{tool_text, turn_render};
 
-/// SlotHandle backed by `thinker_impl::spawn_resource`.
+/// SlotHandle backed by a `chitin_llama::Session`.
 ///
-/// Holds the `ThinkerResource` so its model_name / gpu_memory_mb
-/// surface verbatim. Also holds an `Arc<dyn ToolFormat>` matching
-/// the loaded model so the client-mode tool-call path can parse
-/// the model's raw output without round-tripping through
-/// thinker_impl.
+/// The session isn't `Send + Sync` on its own (holds a raw
+/// llama.cpp context pointer), so we own it exclusively behind an
+/// `Arc<Mutex<>>` and drive all inference under `smol::unblock` so
+/// the FFI stays off the async executor's carrier threads.
 pub struct LlamaSlot {
-    resource: Box<dyn ThinkerResource>,
-    /// Active tool format for the loaded model. Used by
-    /// [`tool_text::extract_tool_calls`] to parse markers out of
-    /// `raw_text` when the wire request asked for client-side tool
-    /// dispatch, and by [`tool_text::tool_results_to_turns`] to
-    /// wrap incoming tool results before they're spliced into the
-    /// turn list.
+    session: Arc<Mutex<Session>>,
+    model_name: String,
+    /// Active tool-format for marker extraction (`Client` mode).
     tool_format: Arc<dyn ToolFormat>,
-    /// Active chat format — the per-role marker template
-    /// (e.g. Gemma 4's `<|turn>{role}\n…<turn|>`). Used by
-    /// [`turn_render::render_turns`] to convert
-    /// `InferenceInput::Turns` into the raw-prompt string
-    /// thinker_impl expects.
+    /// Active chat template for `InferenceInput::Turns` rendering.
     chat_format: Arc<dyn ChatFormat>,
 }
 
 impl LlamaSlot {
-    /// Build a sensible default `ThinkerConfig` from the binary's
-    /// `--model` / `--model-dir` CLI args and hand off to
-    /// `thinker_impl::spawn_resource`. Fails synchronously if the
-    /// model can't be loaded.
+    /// Load a GGUF and hand back a ready-to-serve slot. `model_dir`
+    /// may be either a `.gguf` file (used as-is) or a directory
+    /// containing one (first sorted `.gguf` wins). `gguf_path`
+    /// explicitly overrides both.
+    ///
+    /// Gemma 4 is the current production target; `tool_format` +
+    /// `chat_format` are hard-coded to Gemma-4 for now. A future
+    /// CLI flag can pick the pair for other model families.
     pub fn spawn(
         model_dir: String,
         gguf_path: Option<String>,
         model_name: String,
-        max_tokens: usize,
+        _max_tokens: usize,
         max_seq_len: u32,
     ) -> Result<Self, String> {
-        // Gemma 4 is the current production target; the per-model
-        // ToolFormat + ChatFormat are the abstraction points for
-        // other models. To support a different model, add a CLI flag
-        // that picks the right pair here (and adjust the channels
-        // driver's marker detection — same Arc<dyn ToolFormat>
-        // value).
-        let tool_format: Arc<dyn ToolFormat> = Arc::new(Gemma4ToolFormat);
-        let chat_format: Arc<dyn ChatFormat> = Arc::new(Gemma4Format);
-
-        let config = ThinkerConfig {
-            model_dir,
-            max_tokens,
-            max_seq_len,
-            json_mode: false,
-            // Static = prefix-cache only, no per-session persistence.
-            // Per-request session continuity is handled via
-            // `SessionMode::Persistent { session_id }` on the wire,
-            // which translates to `CommonSession::DiskBasedSession`
-            // — disk-backed sessions need extra wiring (cache_dir +
-            // system_prompt) that we'll add when a caller actually
-            // needs them.
-            kv_cache: KvCacheMode::Static(String::new()),
-            model_name,
+        let gguf_path = gguf_path.unwrap_or_else(|| resolve_gguf_path(&model_dir));
+        let load_cfg = LoadConfig {
             gguf_path,
-            mtp_head_path: None,
+            max_seq_len,
+            n_gpu_layers: -1,
+            // See parent workspace's llama_slot.rs comment for the
+            // 128 rationale: at deep n_ctx=32K, the per-layer
+            // attention-scores intermediate scales with
+            // `n_batch × n_ctx × n_heads × 2B` — 512 pushed the M4's
+            // Metal budget into IOGPUCommandBufferCallbackError.
+            n_batch: 128,
+            draft_gguf_path: None,
             mtp_draft_n: 0,
-            tool_format: tool_format.clone(),
-            // Empty toolsets — the in-band dispatcher returns
-            // "unknown tool" for every call. When ToolMode::Server
-            // is in effect and the model emits a tool call, the
-            // request's per-turn `inference_config.tools` overrides
-            // this baked-in (empty) catalog.
-            tool_sets: Arc::new(Vec::new()),
         };
-        let resource = thinker_impl::spawn_resource(config);
-        Ok(Self { resource, tool_format, chat_format })
+        let session = Session::load(load_cfg)?;
+        Ok(Self {
+            session: Arc::new(Mutex::new(session)),
+            model_name,
+            tool_format: Arc::new(Gemma4ToolFormat),
+            chat_format: Arc::new(Gemma4Format),
+        })
     }
 }
 
 #[async_trait]
 impl SlotHandle for LlamaSlot {
-    fn model_name(&self) -> &str { self.resource.model_name() }
-    fn gpu_memory_mb(&self) -> Option<u32> { self.resource.gpu_memory_mb() }
+    fn model_name(&self) -> &str { &self.model_name }
+    fn gpu_memory_mb(&self) -> Option<u32> { None }
 
     async fn run(&self, req: SlotRequest) -> Result<SlotResponse, String> {
         self.run_inner(req, None).await
@@ -140,11 +112,6 @@ impl SlotHandle for LlamaSlot {
 }
 
 impl LlamaSlot {
-    /// Unified implementation: when `sink` is `Some`, builds an
-    /// async_channel pair, plumbs the sender into ThinkerRequest.
-    /// stream_tx + progress_tx, and spawns a drain task that
-    /// forwards each event to the sink. When `sink` is `None`, the
-    /// channels stay `None` and the slot behaves as before.
     async fn run_inner(
         &self,
         req: SlotRequest,
@@ -152,32 +119,18 @@ impl LlamaSlot {
     ) -> Result<SlotResponse, String> {
         let SlotRequest { req } = req;
 
-        // Decide tool-dispatch mode up front so we know whether to
-        // set `raw_tool_call` on the inner ThinkerRequest and
-        // whether to parse markers out of the response afterward.
         let want_client_dispatch = match req.inference_config.tool_mode {
             ToolMode::Client => true,
             ToolMode::Server => false,
             ToolMode::Auto => !req.tools.is_empty(),
         };
 
-        // Convert wire ToolDefs → ExternalToolDefs for the
-        // per-turn override that thinker_impl honours.
-        let common_tools = if req.tools.is_empty() {
-            None
-        } else {
-            Some(req.tools.iter().map(to_common_tool_def).collect::<Vec<_>>())
-        };
-
-        // Two prompt assembly paths depending on the wire input:
-        // - Turns: use the model's ChatFormat to render the full
-        //   turn list (tool results spliced in as Role::Tool turns
-        //   first). thinker_impl's `<|turn>`-detection at
-        //   llama_slot.rs:380 sees pre-wrapped markers and skips
-        //   its own templating — no double-wrap.
-        // - Text: legacy path. Just prepend formatted tool results
-        //   to the raw user text; thinker_impl wraps the whole
-        //   thing in one user turn.
+        // Prompt assembly. Two paths matching the wire input variant:
+        //  - Turns: render_turns applies the chat template to a full
+        //    turn list; tool_results_to_turns splices any incoming
+        //    ToolResults in as Role::Tool turns first.
+        //  - Text: raw string. Tool results (if any) get prepended
+        //    to the text as pre-templated blocks.
         let prompt = match &req.input {
             InferenceInput::Turns(turns) => {
                 let mut all = turns.clone();
@@ -196,212 +149,115 @@ impl LlamaSlot {
             }
         };
 
-        // Inference config — wire values override the defaults
-        // when present. None on the wire = "use server default"
-        // (in-process InferenceConfig::default reproduces the
-        // historical baked constants).
-        let mut common_cfg = CommonInferenceConfig::default();
-        common_cfg.disable_think_prefix = req.inference_config.disable_think_prefix;
-        common_cfg.json_mode = to_common_json_mode(req.inference_config.json_mode);
-        if let Some(t) = req.inference_config.temperature { common_cfg.temperature = t; }
-        if let Some(p) = req.inference_config.top_p { common_cfg.top_p = p; }
-        if let Some(r) = req.inference_config.rep_penalty { common_cfg.rep_penalty = r; }
-        if let Some(p) = req.inference_config.presence_penalty { common_cfg.presence_penalty = p; }
-        if let Some(n) = req.inference_config.max_tokens { common_cfg.max_tokens = Some(n as usize); }
-        common_cfg.system_prompt = req.inference_config.system_prompt.clone();
-        common_cfg.tools = common_tools;
-        common_cfg.raw_tool_call = want_client_dispatch;
-
-        // Channel for the slot to drop its single response into.
-        let (resp_tx, resp_rx) = smol::channel::bounded::<common::handles::ThinkerResponse>(1);
-
-        // Streaming wiring: only set up the chunk + progress
-        // channels when a sink is supplied. The channels driver
-        // skips chunk emission entirely on a None stream_tx, so
-        // non-streaming requests stay zero-overhead.
-        let (stream_tx, stream_rx) = if sink.is_some() {
-            let (tx, rx) = async_channel::bounded::<common::handles::StreamChunk>(64);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        let (progress_tx, progress_rx) = if sink.is_some() {
-            let (tx, rx) = async_channel::bounded::<common::handles::ProgressEvent>(64);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        let thinker_req = ThinkerRequest {
-            role: to_common_role(req.role),
-            input: CommonInput::Text(prompt),
-            max_tokens: req.max_tokens as usize,
-            response_tx: resp_tx,
-            session: to_common_session(req.session),
-            stream_tx,
-            progress_tx,
-            prefix_cache: None,
-            disable_think_prefix: req.inference_config.disable_think_prefix,
-            inference_config: common_cfg,
-            cache_hash: req.cache_hash,
-        };
-
-        let tx = self.resource.request_sender();
-        if let Err(e) = tx.send(thinker_req).await {
-            return Err(format!("slot channel closed: {e}"));
+        // Basic progress trio so streaming consumers see start/end
+        // events even though we don't yet stream individual chunks.
+        if let Some(s) = sink {
+            s.on_progress(model_api_proto::ProgressEvent {
+                phase: "queued".into(),
+                tool: None,
+                detail: None,
+            });
+            s.on_progress(model_api_proto::ProgressEvent {
+                phase: "gen_start".into(),
+                tool: None,
+                detail: None,
+            });
         }
 
-        // Streaming flow: poll the response channel while draining
-        // pending chunk + progress events into the sink. Yields
-        // between try_recv attempts so the slot thread and event
-        // emitters can make progress.
-        //
-        // Non-streaming flow: a plain await on resp_rx — the
-        // channels are None and nothing else competes for cycles.
-        let common_resp = match (stream_rx.as_ref(), progress_rx.as_ref(), sink) {
-            (Some(srx), Some(prx), Some(sink_ref)) => {
-                let resp = loop {
-                    drain_chunks(srx, sink_ref);
-                    drain_progress(prx, sink_ref);
-                    match resp_rx.try_recv() {
-                        Ok(r) => break r,
-                        Err(async_channel::TryRecvError::Empty) => {
-                            smol::future::yield_now().await;
-                        }
-                        Err(async_channel::TryRecvError::Closed) => {
-                            return Err("slot response channel closed".into());
-                        }
-                    }
-                };
-                // Tail drain. The channels driver emits its final
-                // "stop" chunk AFTER pushing the ThinkerResponse,
-                // so a client that grabs the response and stops
-                // listening would miss it without this loop.
-                drain_chunks(srx, sink_ref);
-                drain_progress(prx, sink_ref);
-                resp
-            }
-            _ => {
-                resp_rx.recv().await
-                    .map_err(|e| format!("slot response channel closed: {e}"))?
-            }
-        };
+        // Blocking inference on the smol blocking pool so the executor
+        // carrier threads stay free. Session's mutex is held only
+        // inside the closure — never crossed .await.
+        let session = self.session.clone();
+        let max_tokens = req.max_tokens as usize;
+        let text = smol::unblock(move || -> Result<String, String> {
+            let mut sess = session.lock().map_err(|e| format!("session mutex poisoned: {e}"))?;
+            let prompt_tokens = sess.tokenize(&prompt, true)?;
+            let out_tokens = sess.generate_raw(&prompt_tokens, max_tokens)?;
+            Ok(sess.detokenize(&out_tokens))
+        }).await?;
 
-        // Extract tool calls from the raw model output when we're in
-        // client-dispatch mode. The channels driver leaves markers
-        // verbatim in `text` (raw_tool_call short-circuits the
-        // marker-stripping state machine), so we scan with the
-        // active model's ToolFormat.
+        if let Some(s) = sink {
+            // Single "everything" chunk. When we grow real streaming
+            // this splits into per-token chunks and the phase order
+            // becomes queued → gen_start → chunk×N → gen_done.
+            s.on_chunk(model_api_proto::StreamChunk {
+                delta_text: text.clone(),
+                finish_reason: None,
+                phase: None,
+            });
+            s.on_progress(model_api_proto::ProgressEvent {
+                phase: "gen_done".into(),
+                tool: None,
+                detail: None,
+            });
+        }
+
         let tool_calls = if want_client_dispatch {
-            tool_text::extract_tool_calls(&common_resp.text, &*self.tool_format)
+            tool_text::extract_tool_calls(&text, &*self.tool_format)
         } else {
             Vec::new()
         };
 
+        // session_id echoing: Persistent sessions get their id
+        // reflected back. Non-persistent (Stateless) returns None so
+        // clients can distinguish. Prefix-cache continuity for
+        // Persistent sessions is a follow-up; today every request
+        // re-prefills the full prompt.
+        let session_id = match req.session {
+            model_api_proto::SessionMode::Persistent { session_id } => Some(session_id),
+            model_api_proto::SessionMode::Stateless => None,
+        };
+
         Ok(SlotResponse(InferenceResponse {
-            text: common_resp.text,
-            session_id: common_resp.session_id,
-            raw_text: common_resp.raw_text,
-            injections: common_resp.injections,
+            text,
+            session_id,
+            raw_text: None,
+            injections: Vec::new(),
             tool_calls,
-            replacement: common_resp.replacement.map(|r| SessionReplacement {
-                template_session_id: r.template_session_id,
-                input: r.input,
-            }),
+            replacement: None,
         }))
     }
 }
 
-// ── Streaming drain helpers ─────────────────────────────────────────
-
-fn drain_chunks(rx: &async_channel::Receiver<common::handles::StreamChunk>, sink: &dyn StreamSink) {
-    while let Ok(c) = rx.try_recv() {
-        sink.on_chunk(model_api_proto::StreamChunk {
-            delta_text: c.delta_text,
-            finish_reason: c.finish_reason,
-            phase: c.phase,
-        });
+/// Resolve a caller's `--model` argument to a concrete `.gguf`
+/// path. Matches the parent workspace's `resolve_gguf_path` in
+/// `thinker_impl::llama_slot`: extension takes precedence over
+/// filesystem existence so `/path/to/x.gguf` is honoured before
+/// the model is fetched; a directory input picks its first
+/// sorted `.gguf`; anything else falls back to the historical
+/// `<dir>/model.gguf` symlink.
+fn resolve_gguf_path(model_dir: &str) -> String {
+    let p = std::path::Path::new(model_dir);
+    let is_gguf_name = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false);
+    if is_gguf_name {
+        return model_dir.to_string();
     }
-}
-
-fn drain_progress(rx: &async_channel::Receiver<common::handles::ProgressEvent>, sink: &dyn StreamSink) {
-    while let Ok(p) = rx.try_recv() {
-        sink.on_progress(model_api_proto::ProgressEvent {
-            phase: p.phase,
-            tool: p.tool,
-            detail: p.detail,
-        });
-    }
-}
-
-// Tool result folding + tool call extraction relocated to
-// `crate::tool_text` so the helpers can be unit-tested without
-// pulling in the whole LlamaSlot dep tree, and so a future
-// non-llama-cpp slot can reuse them.
-
-// ── Translation helpers ─────────────────────────────────────────────
-
-fn to_common_role(r: GpuRole) -> CommonRole {
-    match r {
-        GpuRole::Fast => CommonRole::Fast,
-        GpuRole::Deep => CommonRole::Deep,
-        GpuRole::Asr  => CommonRole::Asr,
-        GpuRole::Omni => CommonRole::Omni,
-    }
-}
-
-fn to_common_input(i: InferenceInput) -> CommonInput {
-    match i {
-        InferenceInput::Text(t) => CommonInput::Text(t),
-        // Turns -> text fallback for the dead-code helper. Real Turns
-        // handling for the LlamaSlot path lives in P4 (chat-format
-        // render); this branch exists only to satisfy exhaustiveness.
-        InferenceInput::Turns(turns) => CommonInput::Text(
-            turns.into_iter().map(|t| t.content).collect::<Vec<_>>().join("\n"),
-        ),
-        InferenceInput::Pcm { samples, sample_rate } => CommonInput::Pcm { samples, sample_rate },
-        InferenceInput::Mel { data, frames } => CommonInput::Mel { data, frames },
-    }
-}
-
-#[allow(dead_code)]
-fn _hold_to_common_input(i: InferenceInput) -> CommonInput { to_common_input(i) }
-
-fn to_common_session(s: SessionMode) -> CommonSession {
-    match s {
-        SessionMode::Stateless => CommonSession::NoSession,
-        SessionMode::Persistent { session_id } => {
-            if session_id.is_empty() {
-                CommonSession::NewSession
-            } else {
-                CommonSession::DiskBasedSession(session_id)
+    if p.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            let mut ggufs: Vec<std::path::PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|q| {
+                    q.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.eq_ignore_ascii_case("gguf"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            ggufs.sort();
+            if let Some(first) = ggufs.first() {
+                log::info!(
+                    "llama_slot: picked {} from {} (set gguf_path to override)",
+                    first.display(),
+                    p.display(),
+                );
+                return first.to_string_lossy().into_owned();
             }
         }
     }
+    format!("{model_dir}/model.gguf")
 }
-
-fn to_common_json_mode(m: JsonMode) -> CommonJsonMode {
-    match m {
-        JsonMode::None => CommonJsonMode::None,
-        JsonMode::ToolOnly => CommonJsonMode::ToolOnly,
-        JsonMode::ThinkingWithTools => CommonJsonMode::ThinkingWithTools,
-        JsonMode::AnyJSON => CommonJsonMode::AnyJSON,
-        JsonMode::NotesClassifierJSON => CommonJsonMode::NotesClassifierJSON,
-    }
-}
-
-fn to_common_tool_def(t: &ToolDef) -> ExternalToolDef {
-    ExternalToolDef {
-        name: t.name.clone(),
-        description: t.description.clone(),
-        parameters: t.parameters.iter().map(|p| ExternalToolParam {
-            name: p.name.clone(),
-            param_type: p.param_type.clone(),
-            required: p.required,
-            description: p.description.clone(),
-        }).collect(),
-    }
-}
-
-// Parser unit tests moved to crate::tool_text::tests alongside the
-// extract_tool_calls implementation.

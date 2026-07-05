@@ -16,16 +16,9 @@ members = [
     "chitin_llama",
     "model_api_proto",
     "model_api_client",
-    # model_api_server temporarily excluded during the phase-2/3/4
-    # refactor — its Cargo.toml still path-deps into ../common and
-    # ../thinker_impl (parent-workspace crates that don't exist here).
-    # Re-added in phase 4 once llama_slot has been rewritten to use
-    # the in-tree chitin_llama + gemma_utils + proto types.
-    # "model_api_server",
+    "model_api_server",
 ]
 exclude = [
-    # Temporary during phase 2/3 — see note above.
-    "model_api_server",
     # napi-rs cdylib, built via `napi build` not plain cargo.
     "model_api_node",
     # Submodules — each has its own workspace root.

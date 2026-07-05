@@ -43,6 +43,15 @@ pub struct Session {
     mtp_draft_n: u32,
 }
 
+// SAFETY: Session holds a raw pointer into a llama.cpp MTP context
+// which the underlying C++ code treats as single-owner. Callers are
+// expected to hold the Session behind a Mutex (or otherwise guarantee
+// exclusive access) so only one thread touches the FFI at a time.
+// These impls exist so a Session can live inside an `Arc<Mutex<>>`
+// dispatched from an async executor's blocking pool.
+unsafe impl Send for Session {}
+unsafe impl Sync for Session {}
+
 /// Build configuration for `Session::load`. Mirrors the GGUF-specific
 /// subset of `lib::ThinkerConfig`.
 pub struct LoadConfig {
