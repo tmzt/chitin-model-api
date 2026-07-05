@@ -2,3 +2,11 @@
 	path = deps/litert-rs
 	url = git@github.com:tmzt/LiteRT.git
 	branch = main-kvcache
+[submodule "deps/llama-cpp-2"]
+	path = deps/llama-cpp-2
+	url = git@github.com:tmzt/llama-cpp-rs.git
+	branch = main-llamacpp-atomic
+[submodule "deps/llama.cpp"]
+	path = deps/llama.cpp
+	url = https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
+	branch = feature/turboquant-kv-cache
