@@ -1,0 +1,4 @@
+[submodule "deps/litert-rs"]
+	path = deps/litert-rs
+	url = git@github.com:tmzt/LiteRT.git
+	branch = main-kvcache
